@@ -13,7 +13,7 @@ import pandas as pd
 from flask import Blueprint, render_template, request, redirect, url_for, send_file, make_response, jsonify
 from datetime import datetime, timedelta
 from sqlalchemy import func
-from models import db, Order, MatchedPosition, Meeting
+from models.models import db, Order, MatchedPosition, Meeting
 
 admin_bp = Blueprint('admin_bp', __name__, template_folder='templates', static_folder='static')
 
@@ -479,10 +479,7 @@ def get_meetings_for_month(year, month):
             'Notes': meeting.notes
         }
         meetings_grouped[meeting_day].append(meeting_data)
-
     return meetings_grouped
-
-
 
 def generate_month_days(year, month):
     # Number of days in the month and the first weekday of the month

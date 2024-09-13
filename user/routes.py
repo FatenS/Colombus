@@ -1,17 +1,19 @@
 from datetime import datetime, timedelta
-from io import BytesIO
-from sqlalchemy import func
-from models import db, User, OpenPosition, Historical, BankAccount, Order, Meeting
+from models.models import db, User, OpenPosition, Historical, BankAccount, Order, Meeting
 from flask_login import login_user, LoginManager, logout_user
 from matplotlib import pyplot as plt
 import numpy as np
-import requests
 from flask import render_template, request, redirect, url_for, session, jsonify, Blueprint, flash, send_from_directory
 import pandas as pd
-import calendar
-from bs4 import BeautifulSoup
 from flask_socketio import SocketIO
-import re
+from utils import convert_to_date, allowed_file
+from .services.bank_service import BankService
+from .services.user_service import UserService
+from services.order_service import get_order_details, submit_order, delete_order, data_for_chart
+from .services.historical_service import get_historical_rates, create_historical_record
+from services.exchange_rate_service import fetch_and_calculate_exchange_rates
+from .services.live_rates_service import update_currency_rates, rates, metric, rates_all, lastUpdated, socketio
+from .services.meeting_service import MeetingService
 
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
                     template_folder='templates')
@@ -37,19 +39,6 @@ def home():
 @user_bp.route('/glossary')
 def glossary():
     return render_template('glossary.html')
-
-
-def convert_to_date(value):
-    if pd.isnull(value):
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, pd.Timestamp):
-        return value.date()
-    try:
-        return pd.to_datetime(value).date()
-    except ValueError:
-        return None
 
 
 @user_bp.route('/single1')
@@ -255,48 +244,20 @@ def load_and_process_data(currency='USD'):
 
 # =========== Dashboard ==============================
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'xlsx'}
-
-
 @user_bp.route('/upload', methods=['POST'])
 def upload():
+    from services.file_handler import process_uploaded_file
+    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
+        flash('Please upload a valid file!')
+        return redirect(request.url)
+    
+    file = request.files['file']
     try:
-        if 'file' not in request.files:
-            flash('No file part')
-            return redirect(request.url)
-        file = request.files['file']
-        if file.filename == '':
-            flash('No selected file')
-            return redirect(request.url)
-        if file and allowed_file(file.filename):
-            file_stream = file.stream
-            file_stream.seek(0)
-            bytes_io = BytesIO(file_stream.read())
-
-            # Depending on your pandas version and the excel file type, you may need to specify an engine, e.g., engine='openpyxl' for .xlsx files
-            uploaded_data = pd.read_excel(bytes_io, header=None, skiprows=1)
-
-            for index, row in uploaded_data.iterrows():
-                new_position = OpenPosition(
-                    value_date=convert_to_date(row[0]),
-                    currency=row[1],
-                    fx_amount=row[2],
-                    type=row[3],
-                    user=session["username"]
-                )
-
-                db.session.add(new_position)
-
-            db.session.commit()
-            return redirect(url_for('user_bp.dashboard', error='File uploaded and processed successfully'))
-        else:
-            flash('Please upload a file in the correct format as per our template!')
-            return redirect(request.url)
+        process_uploaded_file(file.stream)
+        return redirect(url_for('user_bp.dashboard', error='File uploaded and processed successfully'))
     except Exception as e:
-        # Log the error here if needed
-        return redirect(
-            url_for('user_bp.dashboard', error='Please upload a file in the correct format as per our template!'))
+        flash(f'Error processing file: {str(e)}')
+        return redirect(url_for('user_bp.dashboard'))
 
 
 @user_bp.route('/download-template')
@@ -306,7 +267,6 @@ def download_template():
 @user_bp.route('/download-template-sec')
 def download_template_sec():
     return send_from_directory('user/static', 'templatedash.xlsx', as_attachment=True)
-
 
 @user_bp.route('/metrics/<currency>')
 def metrics(currency):
@@ -477,325 +437,6 @@ def dashboard():
 
 # ==========================================================
 
-
-# ================= Bank Accounts ========================
-
-@user_bp.route('/bank')
-def bank():
-    session_user = session.get('username')
-    if not session_user:
-        return redirect(url_for('login'))  # Redirect to login if no user in session
-
-    total_dollar_balance = 0
-    total_eur_balance = 0
-    total_tnd_balance = 0
-    number_of_accounts = 0
-    chart_for_data = []
-    # Fetch bank accounts for the session user
-    accounts = BankAccount.query.filter_by(owner=session_user).all()
-
-    # Calculate the balances, filtering by the current user's username
-    total_balances = db.session.query(
-        BankAccount.currency,
-        func.sum(BankAccount.balance).label('total')
-    ).filter(BankAccount.owner == session_user).group_by(BankAccount.currency).all()
-
-    total_dollar_balance = sum(b.total for b in total_balances if b.currency == 'USD')
-    total_euro_balance = sum(b.total for b in total_balances if b.currency == 'EUR')
-    total_tnd_balance = sum(b.total for b in total_balances if b.currency == 'TND')
-    number_of_accounts = len(accounts)
-
-    # Prepare data for the chart
-    data_for_chart = [{'Currency': b.currency, 'Balance': b.total} for b in total_balances]
-
-    # Convert account objects to dictionary for the template
-    data = [{
-        'Status': account.status,
-        'Account ID': account.id,
-        'Bank': account.bank_name,
-        'Branch': account.branch,
-        'Account Number': account.account_number,
-        'Currency': account.currency,
-        'Date': account.date.strftime('%Y-%m-%d'),
-        'Category': account.category,
-        'Balance': account.balance
-    } for account in accounts]
-    return render_template('Bank.html', data=data, total_dollar_balance=total_dollar_balance,
-                           total_euro_balance=total_euro_balance, total_tnd_balance=total_tnd_balance,
-                           number_of_accounts=number_of_accounts, data_for_chart=data_for_chart)
-
-
-@user_bp.route('/add_account', methods=['POST'])
-def add_account():
-    # Retrieve form data
-    bank = request.form.get('bank')
-    currency = request.form.get('currency')
-    owner = session['username']  # Using session username as owner
-    balance = float(request.form.get('balance'))
-    account_number = request.form.get('nbrAcc')
-    branch = request.form.get('branch')
-    category = request.form.get('category')
-    date = datetime.strptime(request.form.get('date'), '%Y-%m-%d')
-    status = "Open"
-
-    # Generate a primary key
-    pk = f"{bank[:2].upper()}{account_number}"
-
-    # Create and add new bank account to the database
-    new_account = BankAccount(
-        id=pk,
-        bank_name=bank,
-        currency=currency,
-        owner=owner,
-        balance=balance,
-        account_number=account_number,
-        branch=branch,
-        category=category,
-        date=date,
-        status=status
-    )
-    db.session.add(new_account)
-    db.session.commit()
-    return redirect(url_for('user_bp.bank'))
-
-
-@user_bp.route('/details/<int:account_id>', methods=['GET'])
-def get_account_details(account_id):
-    account = BankAccount.query.filter_by(id=account_id).first()
-    if account:
-        account_details = {
-            "id": account.id,
-            "bank_name": account.bank_name,
-            "currency": account.currency,
-            "owner": account.owner,
-            "balance": account.balance,
-            "account_number": account.account_number,
-            "branch": account.branch,
-            "category": account.category,
-            "date": account.date.strftime("%Y-%m-%d"),  # Assuming 'date' is a datetime object
-            "status": account.status
-        }
-        return jsonify(account_details)
-    else:
-        return jsonify({"message": "Account not found"}), 404
-
-
-@user_bp.route('/bank-accounts/<account_id>', methods=['PUT'])
-def update_bank_account(account_id):
-    account = BankAccount.query.get_or_404(account_id)
-    data = request.get_json()
-    account.bank_name = data['bank_name']
-    account.currency = data['currency']
-    account.balance = data['balance']
-    account.category = data.get('category')
-    account.status = data['status']
-    db.session.commit()
-    return jsonify({'message': 'Bank account updated successfully'})
-
-
-@user_bp.route('/bank-accounts/<account_id>', methods=['DELETE'])
-def delete_bank_account(account_id):
-    try:
-        account = BankAccount.query.get_or_404(account_id)
-        db.session.delete(account)
-        db.session.commit()
-        return jsonify({'message': 'Bank account deleted successfully'}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'message': 'Error deleting account: ' + str(e)}), 500
-
-
-# ===============================================================
-
-@user_bp.route('/book_demo', methods=['GET', 'POST'])
-def book_demo():
-    if request.method == 'POST':
-        # Retrieve form data
-        company_name = request.form.get('name')
-        representative_name = request.form.get('rep')
-        representative_position = request.form.get('position')
-        email = request.form.get('email')
-        date_str = request.form.get('date')  # Assuming date is in 'YYYY-MM-DD' format
-        time_str = request.form.get('time')  # Assuming time is in 'HH:MM' format
-        notes = request.form.get('notes', '')
-
-        # Convert string date and time to Python date and time objects
-        date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        time = datetime.strptime(time_str, '%H:%M').time()
-
-        # Create a new Meeting instance
-        new_meeting = Meeting(
-            company_name=company_name,
-            representative_name=representative_name,
-            position=representative_position,
-            email=email,
-            date=date,
-            time=time,
-            notes=notes
-        )
-
-        # Add the new meeting to the session and commit it to the database
-        db.session.add(new_meeting)
-        db.session.commit()
-
-        # Redirect to a new page or back to the form with a success message
-        return redirect(url_for('user_bp.home', message='Meeting booked successfully'))
-    else:
-        # Render the booking form page if method is GET
-        return render_template('book_demo.html')  # Ensure this template exists
-
-
-# ============== Sign up and Login ============================
-@user_bp.route('/signup', methods=['POST'])
-def signup():
-    username = request.form.get('username')
-    email = request.form.get('email')
-    password = request.form.get('password')
-    rating = request.form.get('rating')
-
-    existing_user = User.query.filter_by(username=username).first() or User.query.filter_by(email=email).first()
-    if existing_user:
-        return redirect(url_for('admin_bp.sign', error='Username already exists'))
-
-    new_user = User(username=username, email=email, rating=rating)
-    new_user.set_password(password)
-    db.session.add(new_user)
-    db.session.commit()
-
-    return redirect(url_for('admin_bp.sign', message='Account created successfully'))
-
-
-@user_bp.route('/login', methods=['POST'])
-def login():
-    username = request.form.get('username')
-    password = request.form.get('password')
-
-    user = User.query.filter_by(username=username).first()
-
-    if user and user.check_password(password):
-        session['username'] = user.username
-        login_user(user)
-        return redirect(url_for('user_bp.dashboard', message='Account created successfully'))
-    else:
-        return redirect(url_for('user_bp.home', message='wrong credentials'))
-
-
-# ==========================================
-@user_bp.route('/order')
-def order():
-    session_user = session.get('username')
-    # Retrieve bank accounts from the database
-    bank_accounts = BankAccount.query.filter_by(owner=session_user).all()
-    data = [{
-        'id': account.id,
-        'bank_name': account.bank_name,
-        'currency': account.currency,
-        'owner': account.owner,
-        'balance': account.balance,
-        'account_number': account.account_number,
-        'branch': account.branch,
-        'category': account.category,
-        'date': account.date.strftime('%Y-%m-%d') if account.date else None,
-        'status': account.status,
-    } for account in bank_accounts]
-
-    # Retrieve orders from the database
-    orders = Order.query.filter_by(user=session_user).order_by(Order.status.desc()).all()
-    orders_list = [{
-        'id': order.reference,
-        'transaction_type': order.transaction_type,
-        'amount': order.amount,
-        'currency': order.currency,
-        'value_date': order.value_date.strftime('%Y-%m-%d') if order.value_date else None,
-        'order_date': order.order_date.strftime('%Y-%m-%d') if order.order_date else None,
-        'bank_account': order.bank_account,
-        'reference': order.reference,
-        'signing_key': order.signing_key,
-        'user': order.user,
-        'status': order.status,
-        'rating': order.rating,
-    } for order in orders]
-
-    if orders_list:
-        # Aggregate monthly sums of transaction amounts
-        monthly_sums = db.session.query(
-            db.func.date_trunc('month', Order.value_date).label('month'),
-            db.func.sum(Order.amount).label('total_amount')
-        ).group_by('month').order_by('month').all()
-
-        chart_data = [{'year_month': month.strftime("%Y-%m"), 'Transaction Amount': total_amount} for
-                      month, total_amount in monthly_sums]
-    else:
-        chart_data = []
-
-    return render_template('order.html', orders=orders_list, chart_data=chart_data, data=data)
-
-
-@user_bp.route('/submit_order', methods=['POST'])
-def submit_order():
-    data = request.form.to_dict()
-    session_user = session["username"]
-    # Retrieve the user from the database
-    current_user = User.query.filter_by(username=session_user).first()
-
-    # Check if the user exists and has a rating
-    if current_user and current_user.rating:
-        user_rating = current_user.rating
-    else:
-        user_rating = 0
-
-    new_order = Order(
-        user=session_user,
-        id_unique=data['reference'],
-        status="Pending",
-        rating=user_rating,
-        transaction_type=data['transaction_type'],
-        amount=data['amount'],
-        currency=data['currency'],
-        value_date=data['value_date'],
-        order_date=datetime.today().strftime('%Y-%m-%d'),
-        bank_account=data['bank_account'],
-        reference=data['reference']
-    )
-    db.session.add(new_order)
-    db.session.commit()
-
-    return 'Order executed successfully'
-
-
-@user_bp.route('/delete_order/<orderReference>', methods=['DELETE'])
-def delete_order(orderReference):
-    try:
-        order = Order.query.filter_by(reference=orderReference).first()
-        if order:
-            db.session.delete(order)
-            db.session.commit()
-            return jsonify({'success': True, 'message': 'Order deleted successfully.'})
-        else:
-            return jsonify({'success': False, 'message': 'Order not found.'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)})
-
-
-@user_bp.route('/data_for_chart')
-def data_for_chart():
-    session_user = session.get('username')  # Retrieve the current logged-in user's username from the session
-
-    # Retrieve orders for the current user, filtering by the user's username
-    orders = Order.query.filter(Order.user == session_user).with_entities(Order.value_date, Order.amount).all()
-
-    df = pd.DataFrame(orders, columns=['value_date', 'amount'])
-    df['month'] = pd.to_datetime(df['value_date']).dt.month
-    df['month_abbr'] = df['month'].apply(lambda x: calendar.month_abbr[x])
-    monthly_totals = df.groupby('month_abbr')['amount'].sum().reset_index()
-
-    data = {
-        'months': monthly_totals['month_abbr'].tolist(),
-        'amounts': monthly_totals['amount'].tolist()
-    }
-    return jsonify(data)
-
-
 # reporting part
 def compute_var(data, historical, alpha=0.01):
     # Compute static VaR for each currency
@@ -861,60 +502,6 @@ def generate_exposure_graph(results, graph_path):
     plt.savefig(graph_path)
     plt.close(fig)  # Close the figure to free memory
 
-
-"""""
-def reporting(email):
-    report_output_path = f'user/databases/reports/{email}_report.pdf'
-    graph_path = 'user/databases/reports/graph.png'
-    historical_path = 'user/databases/historical.xlsx'
-    data_path = f'user/databases/reports/{email}.xlsx'
-    # Ensure data is loaded as DataFrame
-    historical = pd.read_excel(historical_path)
-    data = pd.read_excel(data_path)
-
-    report_output_path = f'user/databases/reports/{email}_report.pdf'
-    document = SimpleDocTemplate(report_output_path, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-
-    # Title
-    title = "Analysis of Historical Performance"
-    story.append(Paragraph(title, styles['Title']))
-    story.append(Spacer(1, 0.2 * inch))
-
-    # Objective of the report
-    objective_text = 
-    Objective of the report: This report is a simple analysis of your historical 
-    performance compared to the midmarket historical rates, to show the loss/gain from your 
-    strategy and identify missed opportunities.
-    story.append(Paragraph(objective_text, styles['Normal']))
-    story.append(Spacer(1, 0.2 * inch))
-
-    var = compute_var(data, historical)
-    es = compute_expected_shortfall(data, historical)
-    results = compute_historical_losses(data, historical)
-    average_spread = results['spread'].mean()
-    loss_gain_tnd = results['loss_gain_tnd'].sum()
-
-    metrics_text = f
-    This analysis reveals key financial metrics based on your transaction history. 
-    The Value at Risk (VaR) at 1% is {var}, indicating the maximum loss expected over one year with 99% confidence. 
-    The Expected Shortfall is {es}, representing the average loss in scenarios beyond the VaR threshold.
-    Your average spread is {average_spread}, and the total loss in TND is {loss_gain_tnd}, 
-    highlighting the overall effectiveness of your FX strategy. story.append(Paragraph(metrics_text, styles['Normal']))
-    story.append(Spacer(1, 0.2 * inch))
-
-    # If you have a graph to include
-    generate_exposure_graph(results, 'user/databases/reports/graph.png')
-    graph_path = 'user/databases/reports/graph.png'
-    story.append(Image(graph_path, 4 * inch, 3 * inch))  # Adjust size as needed
-
-    # Finalize the PDF
-    document.build(story)
-    return jsonify({'message': 'Report generated successfully', 'report_path': report_output_path})
-"""
-
-
 @user_bp.route('/save-data', methods=['POST'])
 def save_data():
     request_data = request.get_json()
@@ -924,305 +511,121 @@ def save_data():
     return jsonify({'message': 'We will contact you soon.'})
 
 
-""""
-def load_chart_data(currency):
-    session_name = session["username"]
-    df = pd.read_excel(f'user/databases/{session_name}.xlsx', sheet_name='Open Positions')
 
-    # Filter the DataFrame for the specified currency
-    df = df[df['currency'] == currency]
+# ================= Bank Accounts ========================
 
-    # Convert 'value date' column to datetime
-    df['value date'] = pd.to_datetime(df['value date'])
+@user_bp.route('/bank')
+def bank():
+    session_user = session.get('username')
+    if not session_user:
+        return redirect(url_for('login'))
 
-    # Group by month and sum the amounts
-    df['Month'] = df['value date'].dt.strftime('%Y-%m')
-    exports = df[df['Type'] == 'export'].groupby('Month')['FX Amount'].sum().reset_index()
-    imports = df[df['Type'] == 'import'].groupby('Month')['FX Amount'].sum().reset_index()
+    bank_data = BankService.get_bank_data(session_user)
+    return render_template('Bank.html', **bank_data)
 
-    # Combine exports and imports by month
-    combined = pd.merge(exports, imports, on='Month', how='outer').fillna(0)
-    combined.columns = ['Month', 'Exports', 'Imports']
+@user_bp.route('/add_account', methods=['POST'])
+def add_account():
+    form_data = request.form
+    BankService.add_new_account(form_data, session['username'])
+    return redirect(url_for('user_bp.bank'))
 
-    # Calculate intersection (min of exports and imports)
-    combined['Intersection'] = (combined['Exports'] - combined['Imports']).abs()
+@user_bp.route('/details/<int:account_id>', methods=['GET'])
+def get_account_details(account_id):
+    return BankService.get_account_details(account_id)
 
-    # Prepare the final dataset for the chart
-    chart_data = {
-        'labels': combined['Month'].tolist(),  # Use months as labels
-        'datasets': [
-            {
-                'label': 'Exports',
-                'data': combined['Exports'].tolist(),
-                'fill': 'start',
-                'backgroundColor': 'rgba(2, 8, 56,1)',
-                'borderColor': 'rgba(2, 8, 56,1)',
-                'borderRadius': 3,
-                'order': 2
-            },
-            {
-                'label': 'Imports',
-                'data': combined['Imports'].tolist(),
-                'fill': 'start',
-                'backgroundColor': 'rgba(192, 192, 192, 1)',
-                'borderColor': 'rgba(192, 192, 192, 1)',
-                'borderRadius': 3,
-                'order': 1
-            },
-            {
-                'label': 'Net Exposure',
-                'data': combined['Intersection'].tolist(),
-                'fill': '-1',
-                'backgroundColor': 'rgba(0, 128, 0, 1)',
-                'borderColor': 'rgba(0, 128, 0, 1)',
-                'borderRadius': 3,
-                'order': 0
-            }
-        ]
-    }
+@user_bp.route('/bank-accounts/<account_id>', methods=['PUT'])
+def update_bank_account(account_id):
+    data = request.get_json()
+    return BankService.update_bank_account(account_id, data)
 
-    return chart_data
-
-@user_bp.route('/chart-data/')
-def chart_data():
-    currency = request.args.get('currency', default='EUR')
-    data = load_chart_data(currency)
-    return jsonify(data)
-"""
+@user_bp.route('/bank-accounts/<account_id>', methods=['DELETE'])
+def delete_bank_account(account_id):
+    return BankService.delete_bank_account(account_id)
 
 
-# ===============Databases Part ===========================
+# ======================================= book meeting ======================== 
+@user_bp.route('/book_demo', methods=['GET', 'POST'])
+def book_demo():
+    if request.method == 'POST':
+        form_data = {
+            'name': request.form.get('name'),
+            'rep': request.form.get('rep'),
+            'position': request.form.get('position'),
+            'email': request.form.get('email'),
+            'date': request.form.get('date'),
+            'time': request.form.get('time'),
+            'notes': request.form.get('notes', '')
+        }
+
+        try:
+            message = MeetingService.book_meeting(form_data)
+            flash(message)
+            return redirect(url_for('user_bp.home'))
+        except Exception as e:
+            flash(f'Error booking meeting: {str(e)}')
+            return redirect(request.url)
+    else:
+        return render_template('book_demo.html')  # Ensure this template exists
+
+# ============== Sign up and Login ============================
+
+@user_bp.route('/signup', methods=['POST'])
+def signup():
+    username = request.form.get('username')
+    email = request.form.get('email')
+    password = request.form.get('password')
+    rating = request.form.get('rating')
+    result = UserService.signup_user(username, email, password, rating)
+    return result
+
+@user_bp.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    result = UserService.login_user(username, password)
+    return result
+
 @user_bp.route('/logout')
 def logout():
     session.clear()
     logout_user()
-    return redirect(url_for('user_bp.home', message='Logged out successfully'))
+    flash('Logged out successfully')
+    return redirect(url_for('user_bp.home'))
 
+# ====================== orders ====================
+@user_bp.route('/orders', methods=['GET'])
+def orders():
+    session_user = session.get('username')
+    orders_list, chart_data, bank_data = get_order_details(session_user)
+    return render_template('user/orders.html', orders=orders_list, chart_data=chart_data, bank_data=bank_data)
+
+@user_bp.route('/order', methods=['POST'])
+def order():
+    data = request.json
+    session_user = session.get('username')
+    result = submit_order(data, session_user)
+    return jsonify(result)
+
+@user_bp.route('/delete_order/<string:orderReference>', methods=['DELETE'])
+def delete_order_route(orderReference):
+    result = delete_order(orderReference)
+    return jsonify(result)
 
 # ============ historical rates ============================
 @user_bp.route('/historical', methods=['GET'])
-def get_historical_rates():
+def get_historical_rates_route():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     currency = request.args.get('currency')
-
-    query = Historical.query
-    if start_date:
-        query = query.filter(Historical.date >= start_date)
-    if end_date:
-        query = query.filter(Historical.date <= end_date)
-    if currency:
-        query = query.filter(getattr(Historical, currency) != None)
-
-    results = query.all()
-
-    if currency:
-        data = [{
-            'date': record.date.strftime('%Y-%m-%d'),
-            currency: getattr(record, currency)
-        } for record in results]
-    else:
-        data = [{
-            'id': record.id,
-            'date': record.date.strftime('%Y-%m-%d'),
-            'usd': record.usd,
-            'eur': record.eur,
-            'gbp': record.gbp,
-            'jpy': record.jpy
-        } for record in results]
-
+    data = get_historical_rates(start_date, end_date, currency)
     return jsonify(data)
 
-
 @user_bp.route('/historical', methods=['POST'])
-def create_historical_record():
-    data = request.get_json()
-    new_record = Historical(
-        date=data['date'],
-        usd=data['usd'],
-        eur=data['eur'],
-        gbp=data['gbp'],
-        jpy=data['jpy']
-    )
-    db.session.add(new_record)
-    db.session.commit()
-    return jsonify({'message': 'Historical record created'})
-
-
-def fetch_and_calculate_exchange_rates(app):
-    def get_formatted_date():
-        return datetime.date.today().strftime('%Y-%m-%d')
-
-    today = get_formatted_date()
-    app_id = "a363294bb0b24f7fa5e8bbd91f874c62"  # Your API key
-    url = f"https://openexchangerates.org/api/historical/{today}.json?base=USD&app_id={app_id}"
-
-    response = requests.get(url)
-    response.raise_for_status()  # Check for HTTP errors
-
-    try:
-        data = response.json()
-        rates = data['rates']
-        TND = rates['TND']
-        EUR = rates['EUR']
-        GBP = rates['GBP']
-        JPY = rates['JPY']
-
-        # Calculations
-        GBPTND = TND / GBP
-        USDTND = TND
-        EURTND = TND / EUR
-        JPYTND = (TND / JPY) * 1000
-
-        new_data = {
-            'date': today,
-            'usd': USDTND,
-            'eur': EURTND,
-            'gbp': GBPTND,
-            'jpy': JPYTND,
-        }
-
-        with app.app_context():
-            new_record = Historical(**new_data)
-            db.session.add(new_record)
-            db.session.commit()
-
-    except Exception as error:
-        print("Error processing data:", error)
-
-
-def register_user_jobs(scheduler, app):
-    scheduler.add_job(fetch_and_calculate_exchange_rates, 'cron', hour=11, minute=5, args=[app])
-
-
-# ================== Live rates ==================
-# Initializing rates as dictionaries to hold rates for each currency
-rates = {
-    'USD': {'XE': 0, 'WISE': 0, 'YahooFinance': 0},
-    'EUR': {'XE': 0, 'WISE': 0, 'YahooFinance': 0},
-    'JPY': {'XE': 0, 'WISE': 0, 'YahooFinance': 0}
-}
-metric = {
-    'USD': {"High": 0, "Low": 0, "Average": 0, "Volatility": 0},
-    'EUR': {"High": 0, "Low": 0, "Average": 0, "Volatility": 0},
-    'JPY': {"High": 0, "Low": 0, "Average": 0, "Volatility": 0}
-}
-rates_all = {
-    'EUR/USD': {'rate': 0, 'change': ''},
-    'USD/JPY': {'rate': 0, 'change': ''},
-    'GBP/USD': {'rate': 0, 'change': ''},
-    'EUR/JPY': {'rate': 0, 'change': ''},
-    'GBP/EUR': {'rate': 0, 'change': ''},
-    'USD/CHF': {'rate': 0, 'change': ''},
-}
-
-lastUpdated = None
-
-# Modify URLs to be formatted with currency codes dynamically
-urlTemplateXE = "https://www.xe.com/currencyconverter/convert/?Amount=1&From={}&To=TND"
-urlTemplateWISE = "https://wise.com/us/currency-converter/{}-to-tnd-rate?amount=1"
-urlTemplateYahooFinance = "https://finance.yahoo.com/quote/TND%3DX?p=TND%3DX"  # Note: This might not change dynamically for each currency, as Yahoo Finance's URL structure may not support direct currency conversion paths for all currencies.
-
-socketio = None
-
-
-def init_socketio(app):
-    global socketio
-    socketio = SocketIO(app, cors_allowed_origins="*")
-    return socketio
-
-
-def update_currency_rates(currency):
-    global rates, lastUpdated, metric, rates_all
-    # Modify currency parsing to allow dynamic URL formatting
-    urlXE = urlTemplateXE.format(currency)
-    urlWISE = urlTemplateWISE.format(currency)
-    # Assuming the fixed URL for scraping specific currency pairs
-    urlCurrencyPairs = "https://www.xe.com/currencycharts/"
-
-    # XE.com
-    try:
-        response = requests.get(urlXE)
-        soup = BeautifulSoup(response.content, "html.parser")
-        rates[currency]['XE'] = re.sub(r"[^\d\-.]", "",
-                                       soup.select_one(".result__BigRate-sc-1bsijpp-1.dPdXSB").get_text())
-        # Scrape the High value
-        high_value = soup.select_one('th:contains("High") + td')
-        if high_value:
-            metric[currency]["High"] = high_value.text.strip()
-
-        # Scrape the Low value
-        low_value = soup.select_one('th:contains("Low") + td')
-        if low_value:
-            metric[currency]["Low"] = low_value.text.strip()
-
-        # Scrape the Volatility
-        volatility_value = soup.select_one('th:contains("Volatility") + td')
-        if volatility_value:
-            metric[currency]["Volatility"] = volatility_value.text.strip()
-    except Exception as e:
-        print(f"Error scraping XE.com for {currency}: {e}")
-
-    # Wise.com
-    try:
-        response = requests.get(urlWISE)
-        soup = BeautifulSoup(response.content, "html.parser")
-        rates[currency]['WISE'] = re.sub(r"[^\d\-.]", "", soup.select_one(".text-success").get_text())
-        rates[currency]['YahooFinance'] = re.sub(r"[^\d\-.]", "", soup.select_one(".text-success").get_text())
-    except Exception as e:
-        print(f"Error scraping Wise.com for {currency}: {e}")
-
-    # Calculate the average rate (assuming rates are now correctly fetched and converted to floats)
-    try:
-        rate_values = [float(rates[currency]['XE']), float(rates[currency]['WISE']),
-                       float(rates[currency]['YahooFinance'])]
-        average_rate = sum(rate_values) / 3
-        metric[currency]['Average'] = average_rate
-    except Exception as e:
-        print(f"Error calculating average rate for {currency}: {e}")
-
-    try:
-        response = requests.get(urlCurrencyPairs)
-        soup = BeautifulSoup(response.content, "html.parser")
-        # Find the table by class name
-        currency_table = soup.find_all("table", class_="table__TableBase-sc-1j0jd5l-0")[0]  # Getting the first table
-        rows = currency_table.find_all("tr")[1:]  # Skip header row
-
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 3:  # Ensure there are enough cells for a pair, its rate, and change
-                pair_link = cells[0].find('a')
-                if pair_link:
-                    pair_text = pair_link.get_text(strip=True)
-                    rate_text = cells[1].get_text(strip=True)
-                    change_symbol = cells[2].text.strip()
-
-                    # Determine change direction
-                    change_direction = 'Stable'
-                    if '▲' in change_symbol:
-                        change_direction = 'Up'
-                    elif '▼' in change_symbol:
-                        change_direction = 'Down'
-
-                    for pair in rates_all.keys():
-                        if pair.replace("/", " / ") == pair_text:  # Matching format with the HTML content
-                            rates_all[pair]['rate'] = float(re.sub(r"[^\d.]", "", rate_text))  # Convert rate to float
-                            rates_all[pair]['change'] = change_direction
-    except Exception as e:
-        print(f"Error all currency: {e}")
-
-    print(rates_all)
-
-    lastUpdated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    socketio.emit('rates_update', {
-        'currency': currency,
-        'rates': rates[currency],
-        'lastUpdated': lastUpdated,
-        'metrics': metric[currency],
-        'rates_all': rates_all
-    })
-
-
+def create_historical_record_route():
+    data = request.json
+    message = create_historical_record(data)
+    return jsonify(message)
+#============================live rates and job registration=========
 @user_bp.route('/live-rates', methods=['GET'])
 def get_live_rates():
     currency = request.args.get('currency', 'USD')  # Default to USD/TND if not specified
@@ -1236,7 +639,18 @@ def get_live_rates():
         'rates_all': rates_all
     })
 
+def register_user_jobs(scheduler, app):
+    scheduler.add_job(fetch_and_calculate_exchange_rates, 'cron', hour=11, minute=5, args=[app])
 
 def register_live_rates(scheduler, app):
     for currency in rates.keys():
         scheduler.add_job(update_currency_rates, 'interval', minutes=1, args=[currency])
+
+def init_login_manager(app):
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+
+def init_socketio(app):
+    global socketio
+    socketio = SocketIO(app, cors_allowed_origins="*")
+    return socketio
