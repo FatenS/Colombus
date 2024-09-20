@@ -1,6 +1,8 @@
 
-from models.models import db, Meeting
+from models import Meeting
 from datetime import datetime
+from db import db
+
 
 class MeetingService:
 

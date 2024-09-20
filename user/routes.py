@@ -1,17 +1,17 @@
 from datetime import datetime, timedelta
-from models.models import db, User, OpenPosition, Historical, BankAccount, Order, Meeting
+from models import db, User, OpenPosition, Historical, BankAccount, Order, Meeting
 from flask_login import login_user, LoginManager, logout_user
 from matplotlib import pyplot as plt
 import numpy as np
 from flask import render_template, request, redirect, url_for, session, jsonify, Blueprint, flash, send_from_directory
 import pandas as pd
 from flask_socketio import SocketIO
-from utils import convert_to_date, allowed_file
+from .utils import convert_to_date, allowed_file
 from .services.bank_service import BankService
 from .services.user_service import UserService
-from services.order_service import get_order_details, submit_order, delete_order, data_for_chart
-from .services.historical_service import get_historical_rates, create_historical_record
-from services.exchange_rate_service import fetch_and_calculate_exchange_rates
+from .services.order_service import OrderService
+from .services.historical_service import HistoricalService
+from .services.exchange_rate_service import fetch_and_calculate_exchange_rates
 from .services.live_rates_service import update_currency_rates, rates, metric, rates_all, lastUpdated, socketio
 from .services.meeting_service import MeetingService
 
@@ -30,6 +30,22 @@ def init_login_manager(app):
 
     return login_manager
 
+# User login route
+@user_bp.route('/login', methods=['POST'])
+def login():
+    username = request.form.get('username')
+    password = request.form.get('password')
+
+    user = UserService.get_user_by_username_or_email(username, None)
+
+    if UserService.check_user_password(user, password):
+        session['username'] = user.username
+        login_user(user)
+        flash("Logged in successfully", "success")
+        return redirect(url_for('user_bp.dashboard'))
+    else:
+        flash("Wrong credentials", "error")
+        return redirect(url_for('user_bp.home'))
 
 @user_bp.route('/')
 def home():
@@ -569,61 +585,46 @@ def book_demo():
 
 # ============== Sign up and Login ============================
 
-@user_bp.route('/signup', methods=['POST'])
-def signup():
-    username = request.form.get('username')
-    email = request.form.get('email')
-    password = request.form.get('password')
-    rating = request.form.get('rating')
-    result = UserService.signup_user(username, email, password, rating)
-    return result
 
-@user_bp.route('/login', methods=['POST'])
-def login():
-    username = request.form.get('username')
-    password = request.form.get('password')
-    result = UserService.login_user(username, password)
-    return result
 
-@user_bp.route('/logout')
-def logout():
-    session.clear()
-    logout_user()
-    flash('Logged out successfully')
-    return redirect(url_for('user_bp.home'))
-
-# ====================== orders ====================
+# ============ Order Routes ==================
 @user_bp.route('/orders', methods=['GET'])
 def orders():
     session_user = session.get('username')
-    orders_list, chart_data, bank_data = get_order_details(session_user)
-    return render_template('user/orders.html', orders=orders_list, chart_data=chart_data, bank_data=bank_data)
+    if not session_user:
+        return "No user in session", 400
+    
+    orders_list, chart_data, bank_accounts_data = OrderService.get_order_details(session_user)
+    if not orders_list:
+        return "No orders found", 404
+
+    return render_template('user/orders.html', orders=orders_list, chart_data=chart_data)
 
 @user_bp.route('/order', methods=['POST'])
 def order():
     data = request.json
     session_user = session.get('username')
-    result = submit_order(data, session_user)
+    result = OrderService.submit_order(data, session_user)
     return jsonify(result)
 
 @user_bp.route('/delete_order/<string:orderReference>', methods=['DELETE'])
 def delete_order_route(orderReference):
-    result = delete_order(orderReference)
+    result = OrderService.delete_order(orderReference)
     return jsonify(result)
 
-# ============ historical rates ============================
+# ============ Historical Rates Routes =============
 @user_bp.route('/historical', methods=['GET'])
 def get_historical_rates_route():
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     currency = request.args.get('currency')
-    data = get_historical_rates(start_date, end_date, currency)
+    data = HistoricalService.get_historical_rates(start_date, end_date, currency)
     return jsonify(data)
 
 @user_bp.route('/historical', methods=['POST'])
 def create_historical_record_route():
     data = request.json
-    message = create_historical_record(data)
+    message = HistoricalService.create_historical_record(data)
     return jsonify(message)
 #============================live rates and job registration=========
 @user_bp.route('/live-rates', methods=['GET'])

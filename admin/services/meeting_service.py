@@ -1,6 +1,6 @@
 import calendar
 from datetime import datetime
-from models.models import Meeting
+from models import Meeting
 
 def get_meetings_for_month(year, month):
     meetings = Meeting.query.filter(

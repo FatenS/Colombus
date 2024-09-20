@@ -1,5 +1,6 @@
 from flask import session, jsonify, redirect, url_for, render_template
-from models.models import db, BankAccount
+from db import db
+from models import BankAccount
 from datetime import datetime
 from flask import jsonify
 from datetime import datetime

@@ -1,5 +1,5 @@
 from flask import Flask
-from models.models import db
+from models import db
 from admin.routes import admin_bp, register_admin_jobs
 from user.routes import user_bp, register_user_jobs, init_login_manager, init_socketio, register_live_rates
 from scheduler import scheduler, start_scheduler

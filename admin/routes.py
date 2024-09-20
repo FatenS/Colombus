@@ -2,16 +2,21 @@ import base64
 import io
 import os
 import json
+import random
+import string
 import numpy as np
 import pandas as pd
 from fpdf import FPDF
-from flask import Blueprint, render_template, request, redirect, url_for, send_file, make_response, jsonify
+from flask import Blueprint, render_template, request, redirect, url_for, send_file, make_response, jsonify, flash, session
 from datetime import datetime, timedelta
 from sqlalchemy import func
-from services.order_service import generate_unique_key, scheduled_matching
-from services.export_service import export_pdf, download_excel
-from services.meeting_service import get_meetings_for_month, generate_month_days
-from models.models import db, Order, MatchedPosition, Meeting
+from admin.services.order_service import generate_unique_key, scheduled_matching
+from admin.services.export_service import export_pdf, download_excel
+from admin.services.meeting_service import get_meetings_for_month, generate_month_days
+from models import db, Order, MatchedPosition, Meeting
+from flask_login import login_user, logout_user, current_user
+from user.services.user_service import UserService
+from functools import wraps
 
 admin_bp = Blueprint('admin_bp', __name__, template_folder='templates', static_folder='static')
 
@@ -21,33 +26,110 @@ class JSONEncoder(json.JSONEncoder):
             return int(obj)
         return json.JSONEncoder.default(self, obj)
 
-@admin_bp.route('/page-signup')
-def sign():
-    return render_template('page-signup.html')
+def generate_unique_key(buyer, seller):
+    # Create a unique key based on the first 2 letters of buyer and seller names and 8 random digits
+    random_digits = ''.join(random.choices(string.digits, k=8))
+    return buyer[:1] + seller[:1] + random_digits
 
-@admin_bp.route('/')
+# Role-based access decorator for admins
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin():
+            flash("Access denied. Admins only.", "error")
+            return redirect(url_for('user_bp.login'))
+        return func(*args, **kwargs)
+    return wrapper
+
+
+# Admin sign-in page
+#@admin_required
+@admin_bp.route('/page-signin')
 def main():
     return render_template('page-signin.html')
 
+# Admin sign-up page
+@admin_bp.route('/page-signup')
+#@admin_required
+def sign():
+    return render_template('page-signup.html')
+
+# Admin logout
+@admin_bp.route('/out')
+def logout():
+    logout_user()
+    flash("Logged out successfully", "info")
+    return redirect(url_for('admin_bp.main'))
+"""
+# Admin sign-in route
 @admin_bp.route('/signin', methods=['POST'])
 def signin():
     username = request.form.get('username')
     password = request.form.get('password')
 
-    if username == "engine-takwa" and password == "engine2511@":
-        return redirect(url_for('admin_bp.index', message='Welcome to the admin room'))
+    admin = UserService.get_user_by_username_or_email(username, None)
+
+    if admin and UserService.check_user_password(admin, password) and admin.is_admin():
+        session['username'] = admin.username
+        login_user(admin)
+        flash("Welcome to the admin room", "success")
+        return redirect(url_for('admin_bp.index'))
     else:
-        return redirect(url_for('admin_bp.page-signin', message='wrong credentials'))
+        flash("Wrong credentials or not an admin", "error")
+        return redirect(url_for('admin_bp.main'))
 
-@admin_bp.route('/out')
-def logout():
-    return redirect(url_for('admin_bp.main', message='Logged out successfully'))
+# Admin sign-up users (only accessible to admins)
+@admin_bp.route('/signup', methods=['POST'])
+def signup():
+    username = request.form.get('username')
+    email = request.form.get('email')
+    password = request.form.get('password')
+    rating = request.form.get('rating')
+    role = request.form.get('role')  # user or admin
 
-@admin_bp.route('/rates')
-def rates():
-    return render_template('rates.html')
+    existing_user = UserService.get_user_by_username_or_email(username, email)
+    if existing_user:
+        flash("Username already exists", "error")
+        return redirect(url_for('admin_bp.sign'))
 
-@admin_bp.route('/index', methods=['GET'])
+    UserService.create_user(username, email, password, rating, role)
+    flash("Account created successfully", "success")
+    return redirect(url_for('admin_bp.sign')) """
+
+@admin_bp.route('/signin', methods=['POST'])
+def signin():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    admin = UserService.get_user_by_username_or_email(username, None)
+
+    if admin and UserService.check_user_password(admin, password) and admin.is_admin():
+        session['username'] = admin.username
+        login_user(admin)
+        return jsonify({"message": "Welcome to the admin room"}), 200
+    else:
+        return jsonify({"error": "Wrong credentials or not an admin"}), 401
+
+@admin_bp.route('/signup', methods=['POST'])
+def signup():
+    data = request.get_json()
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+    rating = data.get('rating')
+    role = data.get('role')  # user or admin
+
+    existing_user = UserService.get_user_by_username_or_email(username, email)
+    if existing_user:
+        return jsonify({"error": "Username already exists"}), 409
+
+    UserService.create_user(username, email, password, rating, role)
+    return jsonify({"message": "Account created successfully"}), 201
+
+
+# Admin dashboard route
+@admin_bp.route('/index')
 def index():
     new_orders = Order.query.filter_by(status='Pending').all()
     new_orders_list = [
@@ -104,6 +186,10 @@ def index():
 
     return render_template('index.html', new_orders_list=new_orders_list, metrics=metrics_json, chart_data=chart_data, Area_data=Area_data, formatted_data=formatted_data)
 
+@admin_bp.route('/rates')
+def rates():
+    return render_template('rates.html')
+
 @admin_bp.route('/meetings', methods=['GET'])
 def meetings():
     year = int(request.args.get('year', datetime.now().year))
@@ -127,3 +213,11 @@ def export():
         return download_excel(tables_data)
     else:
         return jsonify({'error': 'Invalid export type'}), 400
+
+def register_admin_jobs(scheduler, app):
+    scheduler.add_job(scheduled_matching, 'cron', hour=16, minute=14, args=[app])
+
+
+
+
+

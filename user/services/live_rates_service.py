@@ -27,54 +27,51 @@ lastUpdated = None
 socketio = None
 
 def update_currency_rates(currency):
-    global rates, lastUpdated, metric, rates_all
-    # Modify currency parsing to allow dynamic URL formatting
+    global rates, lastUpdated
     urlTemplateXE = "https://www.xe.com/currencyconverter/convert/?Amount=1&From={}&To=TND"
     urlTemplateWISE = "https://wise.com/us/currency-converter/{}-to-tnd-rate?amount=1"
     urlXE = urlTemplateXE.format(currency)
     urlWISE = urlTemplateWISE.format(currency)
 
-    # XE.com
     try:
         response = requests.get(urlXE)
         soup = BeautifulSoup(response.content, "html.parser")
-        rates[currency]['XE'] = re.sub(r"[^\d\-.]", "", soup.select_one(".result__BigRate-sc-1bsijpp-1.dPdXSB").get_text())
-        # Scrape the High value
+        xe_rate_element = soup.select_one(".result__BigRate-sc-1bsijpp-1.dPdXSB")
+        if xe_rate_element:
+            rates[currency]['XE'] = re.sub(r"[^\d\-.]", "", xe_rate_element.get_text())
+        else:
+            print(f"XE rate element not found for {currency}")
+
         high_value = soup.select_one('th:contains("High") + td')
         if high_value:
             metric[currency]["High"] = high_value.text.strip()
 
-        # Scrape the Low value
         low_value = soup.select_one('th:contains("Low") + td')
         if low_value:
             metric[currency]["Low"] = low_value.text.strip()
 
-        # Scrape the Volatility
         volatility_value = soup.select_one('th:contains("Volatility") + td')
         if volatility_value:
             metric[currency]["Volatility"] = volatility_value.text.strip()
     except Exception as e:
         print(f"Error scraping XE.com for {currency}: {e}")
 
-    # Wise.com
     try:
         response = requests.get(urlWISE)
         soup = BeautifulSoup(response.content, "html.parser")
-        rates[currency]['WISE'] = re.sub(r"[^\d\-.]", "", soup.select_one(".text-success").get_text())
-        rates[currency]['YahooFinance'] = re.sub(r"[^\d\-.]", "", soup.select_one(".text-success").get_text())
+        wise_rate_element = soup.select_one(".text-success")
+        if wise_rate_element:
+            rates[currency]['WISE'] = re.sub(r"[^\d\-.]", "", wise_rate_element.get_text())
     except Exception as e:
         print(f"Error scraping Wise.com for {currency}: {e}")
 
-    # Calculate the average rate
     try:
-        rate_values = [float(rates[currency]['XE']), float(rates[currency]['WISE']),
-                       float(rates[currency]['YahooFinance'])]
-        average_rate = sum(rate_values) / 3
+        rate_values = [float(rates[currency].get('XE', 0)), float(rates[currency].get('WISE', 0))]
+        average_rate = sum(rate_values) / len(rate_values)
         metric[currency]['Average'] = average_rate
     except Exception as e:
         print(f"Error calculating average rate for {currency}: {e}")
 
-    # Update all currency pairs
     try:
         response = requests.get("https://www.xe.com/currencycharts/")
         soup = BeautifulSoup(response.content, "html.parser")
@@ -89,7 +86,6 @@ def update_currency_rates(currency):
                     pair_text = pair_link.get_text(strip=True)
                     rate_text = cells[1].get_text(strip=True)
                     change_symbol = cells[2].text.strip()
-
                     change_direction = 'Stable'
                     if '▲' in change_symbol:
                         change_direction = 'Up'
@@ -104,10 +100,14 @@ def update_currency_rates(currency):
         print(f"Error all currency: {e}")
 
     lastUpdated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    socketio.emit('rates_update', {
-        'currency': currency,
-        'rates': rates[currency],
-        'lastUpdated': lastUpdated,
-        'metrics': metric[currency],
-        'rates_all': rates_all
-    })
+
+    if socketio:
+        socketio.emit('rates_update', {
+            'currency': currency,
+            'rates': rates[currency],
+            'lastUpdated': lastUpdated,
+            'metrics': metric[currency],
+            'rates_all': rates_all
+        })
+    else:
+        print("SocketIO not initialized.")

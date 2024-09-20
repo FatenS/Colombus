@@ -1,6 +1,7 @@
 from io import BytesIO
 import pandas as pd
-from models.models import db, OpenPosition
+from db import db
+from models import OpenPosition
 from utils import convert_to_date
 from flask import session 
 

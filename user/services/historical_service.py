@@ -1,24 +1,24 @@
-from app import db
-from models.models import Historical
+from models import Historical
+from db import db
 
-def get_historical_rates(start_date=None, end_date=None, currency=None):
-    query = Historical.query
-    if start_date:
-        query = query.filter(Historical.date >= start_date)
-    if end_date:
-        query = query.filter(Historical.date <= end_date)
-    if currency:
-        query = query.filter(getattr(Historical, currency) != None)
+class HistoricalService:
 
-    results = query.all()
+    @staticmethod
+    def get_historical_rates(start_date=None, end_date=None, currency=None):
+        query = Historical.query
+        if start_date:
+            query = query.filter(Historical.date >= start_date)
+        if end_date:
+            query = query.filter(Historical.date <= end_date)
+        if currency:
+            query = query.filter(getattr(Historical, currency) != None)
 
-    if currency:
+        results = query.all()
+
         data = [{
             'date': record.date.strftime('%Y-%m-%d'),
             currency: getattr(record, currency)
-        } for record in results]
-    else:
-        data = [{
+        } for record in results] if currency else [{
             'id': record.id,
             'date': record.date.strftime('%Y-%m-%d'),
             'usd': record.usd,
@@ -27,17 +27,18 @@ def get_historical_rates(start_date=None, end_date=None, currency=None):
             'jpy': record.jpy
         } for record in results]
 
-    return data
+        return data
 
+    @staticmethod
+    def create_historical_record(data):
+        new_record = Historical(
+            date=data['date'],
+            usd=data['usd'],
+            eur=data['eur'],
+            gbp=data['gbp'],
+            jpy=data['jpy']
+        )
+        db.session.add(new_record)
+        db.session.commit()
 
-def create_historical_record(data):
-    new_record = Historical(
-        date=data['date'],
-        usd=data['usd'],
-        eur=data['eur'],
-        gbp=data['gbp'],
-        jpy=data['jpy']
-    )
-    db.session.add(new_record)
-    db.session.commit()
-    return {'message': 'Historical record created'}
+        return {'message': 'Historical record created successfully'}

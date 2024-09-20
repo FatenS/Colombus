@@ -1,6 +1,6 @@
+from models import db, Order
 from datetime import datetime, timedelta
 import pandas as pd
-from models.models import db, Order
 from sqlalchemy import func
 
 def generate_unique_key(buyer, seller):

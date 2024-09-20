@@ -1,6 +1,8 @@
 import requests
 import datetime
-from models.models import Historical, db
+from db import db
+from models import Historical
+
 
 def fetch_and_calculate_exchange_rates(app):
     def get_formatted_date():
