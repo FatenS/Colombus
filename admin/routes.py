@@ -73,7 +73,30 @@ def sign():
     else:
         return render_template("page-signup.html", msg=msg)
 
+    # signin page
+@admin_bp.route('/signin', methods=['GET', 'POST'])
+def signin():
+    msg=""
+    if request.method == 'POST':
+        # search user in database
+        user = User.query.filter_by(email=request.form['email']).first()
+        # if exist check password
+        if user:
+            if  user.password == request.form['password']:
+                # if password matches, login the user
+                login_user(user)
+                return redirect(url_for('index'))
+            # if password doesn't match
+            else:
+                msg="Wrong password"
         
+        # if user does not exist
+        else:
+            msg="User doesn't exist"
+        return render_template('page-signin.html', msg=msg)
+        
+    else:
+        return render_template("page-signin.html", msg=msg)
 
 # Admin dashboard route
 @admin_bp.route('/index')
