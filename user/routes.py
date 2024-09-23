@@ -18,18 +18,6 @@ from .services.meeting_service import MeetingService
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
                     template_folder='templates')
 
-login_manager = None
-
-
-def init_login_manager(app):
-    login_manager = LoginManager(app)
-
-    @login_manager.user_loader
-    def load_user(user_id):
-        return User.query.get(int(user_id))
-
-    return login_manager
-
 # User login route
 @user_bp.route('/login', methods=['POST'])
 def login():
@@ -646,10 +634,6 @@ def register_user_jobs(scheduler, app):
 def register_live_rates(scheduler, app):
     for currency in rates.keys():
         scheduler.add_job(update_currency_rates, 'interval', minutes=1, args=[currency])
-
-def init_login_manager(app):
-    login_manager = LoginManager()
-    login_manager.init_app(app)
 
 def init_socketio(app):
     global socketio

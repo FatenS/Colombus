@@ -1,25 +1,36 @@
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.orm import Mapped
+from sqlalchemy import String
+
+import uuid
 from sqlalchemy.schema import CreateTable
 import io
-
+from flask_security import UserMixin, RoleMixin
 db = SQLAlchemy()
+
+# create table in database for assigning roles
+roles_users = db.Table('roles_users',
+        db.Column('user_id', db.Integer(), db.ForeignKey('user.id')),
+        db.Column('role_id', db.Integer(), db.ForeignKey('role.id')))    
+
+# create table in database for storing users
 class User(db.Model, UserMixin):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(150), unique=True, nullable=False)
-    email = db.Column(db.String(150), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128))
-    role = db.Column(db.String(20), nullable=False, default="user") 
+    __tablename__ = 'user'
+    id = db.Column(db.Integer, autoincrement=True, primary_key=True)
+    email = db.Column(db.String, unique=True)
+    password = db.Column(db.String(255), nullable=False, server_default='')
+    active = db.Column(db.Boolean())
+    # backreferences the user_id from roles_users table
+    roles = db.relationship('Role', secondary=roles_users, backref='roled')
+    fs_uniquifier: Mapped[str] = db.Column(String(64), unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
 
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-    def is_admin(self):
-        return self.role == "admin"
+# create table in database for storing roles
+class Role(db.Model, RoleMixin):
+    __tablename__ = 'role'
+    id = db.Column(db.Integer(), primary_key=True)
+    name = db.Column(db.String(80), unique=True)
 
 class BankAccount(db.Model):
     id = db.Column(db.String, primary_key=True)

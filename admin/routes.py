@@ -10,13 +10,14 @@ from fpdf import FPDF
 from flask import Blueprint, render_template, request, redirect, url_for, send_file, make_response, jsonify, flash, session
 from datetime import datetime, timedelta
 from sqlalchemy import func
-from admin.services.order_service import generate_unique_key, scheduled_matching
-from admin.services.export_service import export_pdf, download_excel
-from admin.services.meeting_service import get_meetings_for_month, generate_month_days
+from .services.order_service import generate_unique_key, scheduled_matching
+from .services.export_service import export_pdf, download_excel
+from .services.meeting_service import get_meetings_for_month, generate_month_days
 from models import db, Order, MatchedPosition, Meeting
 from flask_login import login_user, logout_user, current_user
 from user.services.user_service import UserService
 from functools import wraps
+from models import User, Role
 
 admin_bp = Blueprint('admin_bp', __name__, template_folder='templates', static_folder='static')
 
@@ -26,107 +27,53 @@ class JSONEncoder(json.JSONEncoder):
             return int(obj)
         return json.JSONEncoder.default(self, obj)
 
-def generate_unique_key(buyer, seller):
+"""def generate_unique_key(buyer, seller):
     # Create a unique key based on the first 2 letters of buyer and seller names and 8 random digits
     random_digits = ''.join(random.choices(string.digits, k=8))
-    return buyer[:1] + seller[:1] + random_digits
-
-# Role-based access decorator for admins
-def admin_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if not current_user.is_authenticated or not current_user.is_admin():
-            flash("Access denied. Admins only.", "error")
-            return redirect(url_for('user_bp.login'))
-        return func(*args, **kwargs)
-    return wrapper
+    return buyer[:1] + seller[:1] + random_digits"""
 
 
-# Admin sign-in page
-#@admin_required
-@admin_bp.route('/page-signin')
-def main():
-    return render_template('page-signin.html')
-
-# Admin sign-up page
-@admin_bp.route('/page-signup')
-#@admin_required
+# signup page
+@admin_bp.route('/signup', methods=['GET', 'POST'])
 def sign():
-    return render_template('page-signup.html')
+    msg=""
+    # if the form is submitted
+    if request.method == 'POST':
+    # check if user already exists
+        user = User.query.filter_by(email=request.form['email']).first()
+        msg=""
+        # if user already exists render the msg
+        if user:
+            msg="User already exist"
+            # render signup.html if user exists
+            return render_template('signup.html', msg=msg)
+        
+        # if user doesn't exist
+        
+        # store the user to database
+        user = User(email=request.form['email'], active=1, password=request.form['password'])
+        # store the role
+        role = Role.query.filter_by(id=int(request.form['options'])).first()
+        if not role:
+            msg = "Role not found."
 
-# Admin logout
-@admin_bp.route('/out')
-def logout():
-    logout_user()
-    flash("Logged out successfully", "info")
-    return redirect(url_for('admin_bp.main'))
-"""
-# Admin sign-in route
-@admin_bp.route('/signin', methods=['POST'])
-def signin():
-    username = request.form.get('username')
-    password = request.form.get('password')
+        user.roles.append(role)
 
-    admin = UserService.get_user_by_username_or_email(username, None)
-
-    if admin and UserService.check_user_password(admin, password) and admin.is_admin():
-        session['username'] = admin.username
-        login_user(admin)
-        flash("Welcome to the admin room", "success")
-        return redirect(url_for('admin_bp.index'))
+        # commit the changes to database
+        db.session.add(user)
+        db.session.commit()
+        
+        # login the user to the app
+        # this user is current user
+        login_user(user)
+        # redirect to index page
+        return redirect(url_for('index'))
+        
+    # case other than submitting form, like loading the page itself
     else:
-        flash("Wrong credentials or not an admin", "error")
-        return redirect(url_for('admin_bp.main'))
+        return render_template("page-signup.html", msg=msg)
 
-# Admin sign-up users (only accessible to admins)
-@admin_bp.route('/signup', methods=['POST'])
-def signup():
-    username = request.form.get('username')
-    email = request.form.get('email')
-    password = request.form.get('password')
-    rating = request.form.get('rating')
-    role = request.form.get('role')  # user or admin
-
-    existing_user = UserService.get_user_by_username_or_email(username, email)
-    if existing_user:
-        flash("Username already exists", "error")
-        return redirect(url_for('admin_bp.sign'))
-
-    UserService.create_user(username, email, password, rating, role)
-    flash("Account created successfully", "success")
-    return redirect(url_for('admin_bp.sign')) """
-
-@admin_bp.route('/signin', methods=['POST'])
-def signin():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-
-    admin = UserService.get_user_by_username_or_email(username, None)
-
-    if admin and UserService.check_user_password(admin, password) and admin.is_admin():
-        session['username'] = admin.username
-        login_user(admin)
-        return jsonify({"message": "Welcome to the admin room"}), 200
-    else:
-        return jsonify({"error": "Wrong credentials or not an admin"}), 401
-
-@admin_bp.route('/signup', methods=['POST'])
-def signup():
-    data = request.get_json()
-    username = data.get('username')
-    email = data.get('email')
-    password = data.get('password')
-    rating = data.get('rating')
-    role = data.get('role')  # user or admin
-
-    existing_user = UserService.get_user_by_username_or_email(username, email)
-    if existing_user:
-        return jsonify({"error": "Username already exists"}), 409
-
-    UserService.create_user(username, email, password, rating, role)
-    return jsonify({"message": "Account created successfully"}), 201
-
+        
 
 # Admin dashboard route
 @admin_bp.route('/index')

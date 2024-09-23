@@ -181,16 +181,17 @@
             Please ensure that these credentials are provided to your client for
             login purposes.
           </h4>
-          <form action="/signup" method="post">
+          
+<!-- Show only if user is logged in -->
+{% if current_user.is_authenticated %}
+You are already logged in.
+
+<!-- Show if user is NOT logged in -->    
+{% else %}
+{{ msg }}<br>
+          <form action="#" method="post">
             <div class="form-group">
-              <label for="username">User Name</label>
-              <input
-                type="text"
-                class="form-control"
-                id="username"
-                name="username"
-                placeholder="Enter a username"
-              />
+             
             </div>
             <!-- form-group -->
             <div class="form-group">
@@ -214,25 +215,12 @@
                 placeholder="Enter your password"
               />
             </div>
-            <!-- form-group -->
-            <div class="form-group">
-              <label for="password">Rating</label>
-              <input
-                type="number"
-                class="form-control"
-                id="rating"
-                name="rating"
-                placeholder="Enter an intial rating"
-              />
+           
+              <input type="radio" name="options" id="option1" value=1 required> Admin </input> 
+              <input type="radio" name="options" id="option2" value=2> Client </input><br>
+              <br>
             </div>
-            <!-- form-group -->
-            <div class="form-group">
-              <label for="role">Role</label>
-              <select name="role" class="form-control">
-                <option value="user">User</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
+            
             <button
               class="btn btn-az-primary btn-block"
               type="submit"
@@ -240,7 +228,11 @@
             >
               Create Account
             </button>
+            <!-- Link for signin -->
+            <span>Already have an account?</span>
+            <a href="/signin">Sign in</a>
           </form>
+          {% endif %}
         </div>
         <!-- az-signup-header -->
       </div>
