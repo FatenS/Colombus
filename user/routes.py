@@ -5,6 +5,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 from flask import render_template, request, redirect, url_for, session, jsonify, Blueprint, flash, send_from_directory
 import pandas as pd
+import uuid
 from flask_socketio import SocketIO
 from .utils import convert_to_date, allowed_file
 from .services.bank_service import BankService
@@ -14,65 +15,11 @@ from .services.historical_service import HistoricalService
 from .services.exchange_rate_service import fetch_and_calculate_exchange_rates
 from .services.live_rates_service import update_currency_rates, rates, metric, rates_all, lastUpdated, socketio
 from .services.meeting_service import MeetingService
+from flask_jwt_extended import jwt_required, get_jwt_identity
+
 
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
                     template_folder='templates')
-
-# User login route
-@user_bp.route('/login', methods=['POST'])
-def login():
-    username = request.form.get('username')
-    password = request.form.get('password')
-
-    user = UserService.get_user_by_username_or_email(username, None)
-
-    if UserService.check_user_password(user, password):
-        session['username'] = user.username
-        login_user(user)
-        flash("Logged in successfully", "success")
-        return redirect(url_for('user_bp.dashboard'))
-    else:
-        flash("Wrong credentials", "error")
-        return redirect(url_for('user_bp.home'))
-
-@user_bp.route('/')
-def home():
-    return render_template('home.html')
-
-
-@user_bp.route('/glossary')
-def glossary():
-    return render_template('glossary.html')
-
-
-@user_bp.route('/single1')
-def single1():
-    return render_template('single1.html')
-
-
-@user_bp.route('/single2')
-def single2():
-    return render_template('single2.html')
-
-
-@user_bp.route('/single3')
-def single3():
-    return render_template('single3.html')
-
-
-@user_bp.route('/single4')
-def single4():
-    return render_template('single4.html')
-
-
-@user_bp.route('/single5')
-def single5():
-    return render_template('single5.html')
-
-
-@user_bp.route('/report')
-def report():
-    return render_template('report.html')
 
 @user_bp.route('/main')
 def main():
@@ -576,29 +523,67 @@ def book_demo():
 
 
 # ============ Order Routes ==================
+@user_bp.route('/orders', methods=['POST'])
+@jwt_required()  # Ensure the user is authenticated
+def submit_order():
+    """
+    API for a client to submit an order.
+    """
+    user_id = get_jwt_identity()  # Get the ID of the logged-in user from the JWT token
+    user = User.query.get(user_id)  # Fetch the user object
+    data = request.get_json()
+
+    # Generate a unique ID for the order
+    unique_id = str(uuid.uuid4())
+
+    # Create a new order, using the relationship directly instead of setting user_id manually
+    new_order = Order(
+        id_unique=unique_id,
+        user=user,  # Use the user object, not just the user_id
+        transaction_type=data['transaction_type'],
+        amount=data['amount'],
+        currency=data['currency'],
+        value_date=datetime.strptime(data['value_date'], "%Y-%m-%d"),
+        order_date=datetime.now(),
+        bank_account=data['bank_account'],
+        reference=data.get('reference', 'REF' + unique_id),  # Generate reference if not provided
+        status="Pending",
+        rating=user.rating  
+
+    )
+
+    db.session.add(new_order)
+    db.session.commit()
+
+    return jsonify({"message": "Order executed successfully"}), 201
+
+
+
 @user_bp.route('/orders', methods=['GET'])
-def orders():
-    session_user = session.get('username')
-    if not session_user:
-        return "No user in session", 400
+@jwt_required()  # Ensure the user is authenticated
+def view_orders():
+    """
+    API to view all orders submitted by the logged-in client.
+    """
+    user_id = get_jwt_identity()  # Get the user ID from the JWT token
+    orders = Order.query.filter_by(user_id=user_id).all()
     
-    orders_list, chart_data, bank_accounts_data = OrderService.get_order_details(session_user)
-    if not orders_list:
-        return "No orders found", 404
+    if not orders:
+        return jsonify([]), 200  # Return an empty list if no orders found
+    
+    order_list = []
+    for order in orders:
+        order_list.append({
+            "id": order.id,
+            "transaction_type": order.transaction_type,
+            "amount": order.amount,
+            "currency": order.currency,
+            "value_date": order.value_date.strftime("%Y-%m-%d"),
+            "status": order.status,
+        })
+    
+    return jsonify(order_list), 200
 
-    return render_template('user/orders.html', orders=orders_list, chart_data=chart_data)
-
-@user_bp.route('/order', methods=['POST'])
-def order():
-    data = request.json
-    session_user = session.get('username')
-    result = OrderService.submit_order(data, session_user)
-    return jsonify(result)
-
-@user_bp.route('/delete_order/<string:orderReference>', methods=['DELETE'])
-def delete_order_route(orderReference):
-    result = OrderService.delete_order(orderReference)
-    return jsonify(result)
 
 # ============ Historical Rates Routes =============
 @user_bp.route('/historical', methods=['GET'])

@@ -1,27 +1,38 @@
 from flask import Flask
-from models import db , User, Role
+from flask_cors import CORS
+from models import db, User, Role
 from admin.routes import admin_bp, register_admin_jobs
 from user.routes import user_bp, register_user_jobs, init_socketio, register_live_rates
 from scheduler import scheduler, start_scheduler
 from flask_security import Security, SQLAlchemySessionUserDatastore
-
+from flask_jwt_extended import JWTManager
 
 app = Flask(__name__)
+
+# Enable CORS for all routes
+CORS(app)
+
 app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:pass123@db:5432/postgres'
-# needed for session cookies
 app.config['SECRET_KEY'] = 'MY_SECRET'
-# allows new registrations to application
 app.config['SECURITY_REGISTERABLE'] = True
-# to send automatic registration email to user
 app.config['SECURITY_SEND_REGISTER_EMAIL'] = False
+app.config['JWT_SECRET_KEY'] = 'your_secret_key'
+app.config['JWT_BLACKLIST_ENABLED'] = True
+app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ['access', 'refresh']
+
+
+jwt = JWTManager(app)
 db.init_app(app)
+
+# Register blueprints
 app.register_blueprint(admin_bp, url_prefix='/admin')
 app.register_blueprint(user_bp, url_prefix='/')
 
-# load users, roles for a session
+# Setup security and roles
 user_datastore = SQLAlchemySessionUserDatastore(db.session, User, Role)
 security = Security(app, user_datastore)
 
+# Register background jobs and socket connections
 register_admin_jobs(scheduler, app)
 register_user_jobs(scheduler, app)
 register_live_rates(scheduler, app)
