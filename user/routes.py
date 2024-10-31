@@ -16,6 +16,8 @@ from .services.exchange_rate_service import fetch_and_calculate_exchange_rates
 from .services.live_rates_service import update_currency_rates, rates, metric, rates_all, lastUpdated, socketio
 from .services.meeting_service import MeetingService
 from flask_jwt_extended import jwt_required, get_jwt_identity
+from io import BytesIO
+
 
 
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
@@ -209,11 +211,6 @@ def upload():
     except Exception as e:
         flash(f'Error processing file: {str(e)}')
         return redirect(url_for('user_bp.dashboard'))
-
-
-@user_bp.route('/download-template')
-def download_template():
-    return send_from_directory('user/static', 'template.xlsx', as_attachment=True)
 
 @user_bp.route('/download-template-sec')
 def download_template_sec():
@@ -518,10 +515,6 @@ def book_demo():
     else:
         return render_template('book_demo.html')  # Ensure this template exists
 
-# ============== Sign up and Login ============================
-
-
-
 # ============ Order Routes ==================
 @user_bp.route('/orders', methods=['POST'])
 @jwt_required()  # Ensure the user is authenticated
@@ -558,7 +551,6 @@ def submit_order():
     return jsonify({"message": "Order executed successfully"}), 201
 
 
-
 @user_bp.route('/orders', methods=['GET'])
 @jwt_required()  # Ensure the user is authenticated
 def view_orders():
@@ -583,7 +575,6 @@ def view_orders():
         })
     
     return jsonify(order_list), 200
-
 
 # ============ Historical Rates Routes =============
 @user_bp.route('/historical', methods=['GET'])
@@ -624,3 +615,64 @@ def init_socketio(app):
     global socketio
     socketio = SocketIO(app, cors_allowed_origins="*")
     return socketio
+
+
+#=======batch order upload 
+
+@user_bp.route('/upload-orders', methods=['POST'])
+@jwt_required() 
+def upload_orders():
+    """
+    API for clients to upload orders in bulk via an Excel file.
+    """
+    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
+        return jsonify({'error': 'Invalid file format'}), 400
+    
+    file = request.files['file']
+    
+    try:
+        # Process the uploaded file, using the logged-in user
+        user_id = get_jwt_identity()  # Get the user ID from the JWT token
+        user = User.query.get(user_id)  # Fetch the user object
+
+        result = process_uploaded_file(file.stream, user)  # Pass the user object to the function
+        return jsonify({'message': 'Orders uploaded successfully', 'result': result}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Template download route
+@user_bp.route('/download-template')
+def download_template():
+    return send_from_directory('static', 'template.xlsx', as_attachment=True)
+
+# process_uploaded_file function update in file_handler.py
+def process_uploaded_file(file_stream, user):
+    file_stream.seek(0)
+    bytes_io = BytesIO(file_stream.read())
+    uploaded_data = pd.read_excel(bytes_io)
+
+    for index, row in uploaded_data.iterrows():
+        try:
+            # Assuming the template has these columns: 'Value Date', 'Currency', 'Amount', 'Transaction Type'
+            value_date = convert_to_date(row['Value Date'])
+            currency = row['Currency']
+            amount = row['Amount']
+            transaction_type = row['Transaction Type']
+
+            # Create a new order, using the user object directly
+            new_order = Order(
+                value_date=value_date,
+                currency=currency,
+                amount=amount,
+                transaction_type=transaction_type,
+                status='Pending',  
+                user=user  ,
+                order_date=datetime.now()
+            )
+            db.session.add(new_order)
+        except Exception as e:
+            raise Exception(f"Error processing row {index}: {e}")
+
+    db.session.commit()
+    return f"{len(uploaded_data)} orders successfully uploaded."
+

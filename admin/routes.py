@@ -15,7 +15,7 @@ from sqlalchemy import func
 from .services.order_service import generate_unique_key, scheduled_matching
 from .services.export_service import export_pdf, download_excel
 from .services.meeting_service import get_meetings_for_month, generate_month_days
-from models import db, Order, MatchedPosition, Meeting
+from models import db, Order, MatchedPosition, ExchangeData
 from flask_login import login_user, logout_user, current_user
 from user.services.user_service import UserService
 from functools import wraps
@@ -318,33 +318,8 @@ def scheduled_matching(app):
             db.session.commit()
 
         else:
-            print("No pending orders found for matching.")
+            print("No pending orders found for matching.")"""
 
-
-@admin_bp.route('/matched_orders', methods=['GET'])
-@jwt_required()
-@roles_required('Admin')
-def view_matched_orders():
-    
-    matched_orders = Order.query.filter_by(status='Matched').all()
-    
-    # Prepare the list of matched orders to return
-    order_list = []
-    for order in matched_orders:
-        order_list.append({
-            "id": order.id,
-            "user": order.user.email if order.user else "Unknown",
-            "transaction_type": order.transaction_type,
-            "amount": order.amount,
-            "currency": order.currency,
-            "value_date": order.value_date.strftime("%Y-%m-%d"),
-            "status": order.status,
-            "execution_rate": order.execution_rate,
-            "bank_name": order.bank_name,
-        })
-
-    return jsonify(order_list), 200
- """
 
 @admin_bp.route('/run_matching', methods=['POST'])
 @jwt_required()
@@ -360,8 +335,6 @@ def run_matching():
         return jsonify({'message': 'Matching process executed successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-
 
 
 def manual_matching(app):
@@ -568,3 +541,134 @@ def view_market_orders():
 
 def register_admin_jobs(scheduler, app):
     scheduler.add_job(scheduled_matching, 'cron', hour=16, minute=14, args=[app])
+
+
+# Helper function to calculate forward rate
+def calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days):
+    return spot_rate * ((1 + yield_domestic  * days / 360) / (1 + yield_foreign * days / 360))
+
+
+# VaR table based on currency, period, and alpha level
+var_table = {
+    'USD': {
+        '1m': {'1%': -0.038173, '5%': -0.026578, '10%': -0.020902},
+        '3m': {'1%': -0.081835, '5%': -0.062929, '10%': -0.048737},
+        '6m': {'1%': -0.200238, '5%': -0.194159, '10%': -0.186580}
+    },
+    'EUR': {
+        '1m': {'1%': -0.188726, '5%': -0.176585, '10%': -0.160856},
+        '3m': {'1%': -0.187569, '5%': -0.180371, '10%': -0.174856},
+        '6m': {'1%': -0.199737, '5%': -0.192892, '10%': -0.185136}
+    }
+}
+
+# Helper function to determine yield period 
+def get_yield_period(days):
+    if days <= 60:
+        return '1m'
+    elif days <= 120:
+        return '3m'
+    else:
+        return '6m'
+
+# calculate VaR based on currency, days, and amount
+def calculate_var(currency, days, amount):
+
+    # Determine the correct time period for VaR (1m, 3m, or 6m)
+    period = get_yield_period(days)
+    
+    # Retrieve the correct VaR rates for the currency and period
+    currency_var = var_table.get(currency.upper(), {}).get(period, {})
+    
+    # Calculate the Value at Risk for each confidence level
+    var_1 = currency_var.get('1%', 0.0) * abs(amount)
+    var_5 = currency_var.get('5%', 0.0) * abs(amount)
+    var_10 = currency_var.get('10%', 0.0) * abs(amount)
+    
+    return {'1%': var_1, '5%': var_5, '10%': var_10}
+
+
+# API to calculate VaR for each order
+@admin_bp.route('/api/calculate-var', methods=['GET'])
+def calculate_var_api():
+    try:
+        # Load orders
+        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
+        today = datetime.today().date()
+        var_calculations = []
+
+        for _, order in orders.iterrows():
+            currency = order['currency']
+            amount = abs(order['amount'])
+            order_date = pd.to_datetime(order['value_date']).date()
+            days_diff = (today - order_date).days  # Calculate days from order's value date to today
+            
+            # Directly use `calculate_var` to get VaR values for each level
+            var_values = calculate_var(currency, days_diff, amount)
+
+            var_calculations.append({
+                "Value Date": order_date.isoformat(),
+                "Days": days_diff,
+                "VaR 1%": var_values['1%'],
+                "VaR 5%": var_values['5%'],
+                "VaR 10%": var_values['10%']
+            })
+
+        return jsonify(var_calculations), 200
+
+    except Exception as e:
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+    
+
+
+@admin_bp.route('/upload-file', methods=['POST'])
+def upload_file():
+    file = request.files['file']
+    df = pd.read_excel(file)
+    df['Date'] = pd.to_datetime(df['Date']).dt.date
+
+    # Save to the database without renaming columns
+    df.to_sql('exchange_data', db.engine, if_exists='replace', index=False)
+    return jsonify({"message": "File uploaded successfully"}), 200
+
+
+@admin_bp.route('/api/calculate-forward-rate', methods=['GET'])
+def calculate_forward_rate_api():
+    try:
+        # Load exchange data and orders
+        df = pd.read_sql('SELECT * FROM exchange_data', db.engine)
+        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
+
+        today = datetime.today().date()
+        today_data = df[df['Date'] == today]
+        forward_rates = []
+
+        if today_data.empty:
+            return jsonify({"error": "No exchange data found for today's date"}), 404
+
+        for _, order in orders.iterrows():
+            currency = order['currency']
+            order_date = pd.to_datetime(order['value_date']).date()
+            days_diff = (today - order_date).days  # Calculate days from order's value date to today
+
+            try:
+                # Retrieve today's spot rate and yield values for the currency and TND
+                spot_rate = today_data[f'Spot {currency.upper()}'].values[0]
+                yield_foreign = today_data[f'{get_yield_period(days_diff).upper()} {currency.upper()}'].values[0]
+                yield_domestic = today_data[f'{get_yield_period(days_diff).upper()} TND'].values[0]
+            except KeyError as e:
+                print(f"Missing required field in exchange data: {str(e)}")
+                continue
+
+            # Calculate the forward rate
+            forward_rate = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
+            forward_rates.append({
+                "Value Date": order_date.isoformat(),
+                "Days": days_diff,
+                "Forward Rate": forward_rate
+            })
+
+        return jsonify(forward_rates), 200
+
+    except Exception as e:
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500

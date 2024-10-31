@@ -62,7 +62,7 @@ class Order(db.Model):
     currency = db.Column(db.String(3), nullable=False, index=True)
     value_date = db.Column(db.Date, nullable=False, index=True)
     order_date = db.Column(db.Date, nullable=False)
-    bank_account = db.Column(db.String(100), nullable=False)
+    bank_account = db.Column(db.String(100))
     reference = db.Column(db.String(100))
     signing_key = db.Column(db.String(255))
     status = db.Column(Enum('Pending', 'Executed', 'Market','Matched', name='order_status'), nullable=False, default='Pending')
@@ -114,3 +114,20 @@ class MatchedPosition(db.Model):
     sell_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
     buy_order = db.relationship('Order', foreign_keys=[buy_order_id], backref='buy_positions')
     sell_order = db.relationship('Order', foreign_keys=[sell_order_id], backref='sell_positions')
+
+class ExchangeData(db.Model):
+    __tablename__ = 'exchange_data'
+
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, name='Date')
+    spot_usd = db.Column(db.Float, nullable=False, name='Spot USD')
+    spot_eur = db.Column(db.Float, nullable=False, name='Spot EUR')
+    tnd_1m = db.Column(db.Float, nullable=False, name='1M TND')
+    eur_1m = db.Column(db.Float, nullable=False, name='1M EUR')
+    usd_1m = db.Column(db.Float, nullable=False, name='1M USD')
+    tnd_3m = db.Column(db.Float, nullable=False, name='3M TND')
+    eur_3m = db.Column(db.Float, nullable=False, name='3M EUR')
+    usd_3m = db.Column(db.Float, nullable=False, name='3M USD')
+    tnd_6m = db.Column(db.Float, nullable=False, name='6M TND')
+    eur_6m = db.Column(db.Float, nullable=False, name='6M EUR')
+    usd_6m = db.Column(db.Float, nullable=False, name='6M USD')
