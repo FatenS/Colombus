@@ -5,6 +5,8 @@ from sqlalchemy.orm import Mapped
 from sqlalchemy import String, Enum, CheckConstraint
 import uuid
 from flask_security import UserMixin, RoleMixin
+from datetime import datetime
+
 
 db = SQLAlchemy()
 
@@ -53,35 +55,37 @@ class OpenPosition(db.Model):
     type = db.Column(db.String(50), nullable=False)
     user = db.Column(db.String(120), nullable=False)
 
-
 class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    id_unique = db.Column(db.String(80), nullable=False, default=lambda: str(uuid.uuid4()))  # Automatically generate UUID
+    id_unique = db.Column(db.String(80), nullable=False, default=lambda: str(uuid.uuid4()))
     transaction_type = db.Column(db.String(50), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
+    amount = db.Column(db.Float, nullable=False)  # Remaining amount for unmatched or partially matched orders
+    original_amount = db.Column(db.Float, nullable=False)  # Initial order amount
     currency = db.Column(db.String(3), nullable=False, index=True)
     value_date = db.Column(db.Date, nullable=False, index=True)
+    transaction_date = db.Column(db.Date, nullable=False)
     order_date = db.Column(db.Date, nullable=False)
     bank_account = db.Column(db.String(100))
     reference = db.Column(db.String(100))
     signing_key = db.Column(db.String(255))
-    status = db.Column(Enum('Pending', 'Executed', 'Market','Matched', name='order_status'), nullable=False, default='Pending')
+    status = db.Column(Enum('Pending', 'Executed', 'Market','Cancelled', 'Matched', name='order_status'), nullable=False, default='Pending')
     rating = db.Column(db.Integer)
-    
-    # Add these fields to track the execution rate and bank name
+    deleted = db.Column(db.Boolean, default=False, nullable=False)
+    historical_loss = db.Column(db.Float, nullable=True, default=0.02)
+    interbank_rate = db.Column(db.Float, nullable=True, default=None)
     execution_rate = db.Column(db.Float, nullable=True, default=None)
     bank_name = db.Column(db.String(100), nullable=True, default=None)
-
-    # Foreign key to User model
+    matched_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=True)  
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    # Relationship to User model
+    matched_amount = db.Column(db.Float, nullable=True, default=0.0)  
+    # Relationships
     user = db.relationship('User', backref='orders', lazy=True)
+    matched_order = db.relationship('Order', remote_side=[id], backref='related_orders')
 
     # Adding a check constraint for the 'amount'
     __table_args__ = (
         CheckConstraint('amount >= 0', name='check_amount_positive'),
     )
-
 
 class Meeting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -92,28 +96,6 @@ class Meeting(db.Model):
     date = db.Column(db.Date, nullable=False)
     time = db.Column(db.Time, nullable=False)
     notes = db.Column(db.Text)
-
-class Historical(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    date = db.Column(db.Date, nullable=False)
-    usd = db.Column(db.Float, nullable=False)
-    eur = db.Column(db.Float, nullable=False)
-    gbp = db.Column(db.Float, nullable=False)
-    jpy = db.Column(db.Float, nullable=False)
-
-class MatchedPosition(db.Model):
-    id = db.Column(db.String, primary_key=True)
-    value_date = db.Column(db.Date, nullable=False)
-    currency = db.Column(db.String(3), nullable=False)
-    buyer = db.Column(db.String(100), nullable=False)
-    buyer_rate = db.Column(db.Integer, nullable=False)
-    seller = db.Column(db.String(100), nullable=False)
-    seller_rate = db.Column(db.Integer, nullable=False)
-    matched_amount = db.Column(db.Float, nullable=False)
-    buy_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
-    sell_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
-    buy_order = db.relationship('Order', foreign_keys=[buy_order_id], backref='buy_positions')
-    sell_order = db.relationship('Order', foreign_keys=[sell_order_id], backref='sell_positions')
 
 class ExchangeData(db.Model):
     __tablename__ = 'exchange_data'
@@ -131,3 +113,16 @@ class ExchangeData(db.Model):
     tnd_6m = db.Column(db.Float, nullable=False, name='6M TND')
     eur_6m = db.Column(db.Float, nullable=False, name='6M EUR')
     usd_6m = db.Column(db.Float, nullable=False, name='6M USD')
+
+
+class AuditLog(db.Model):
+    __tablename__ = 'audit_log'
+    id = db.Column(db.Integer, primary_key=True)
+    action_type = db.Column(db.String(50), nullable=False) 
+    table_name = db.Column(db.String(50), nullable=False)  
+    record_id = db.Column(db.String(80), nullable=False)  
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False) 
+    timestamp = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    details = db.Column(db.Text)  # JSON string 
+
+    user = db.relationship('User', backref='audit_logs')

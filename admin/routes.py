@@ -15,11 +15,11 @@ from sqlalchemy import func
 from .services.order_service import generate_unique_key, scheduled_matching
 from .services.export_service import export_pdf, download_excel
 from .services.meeting_service import get_meetings_for_month, generate_month_days
-from models import db, Order, MatchedPosition, ExchangeData
+from models import db, Order, ExchangeData
 from flask_login import login_user, logout_user, current_user
 from user.services.user_service import UserService
 from functools import wraps
-from models import User, Role
+from models import User, Role, AuditLog
 from flask_security import roles_accepted
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -85,8 +85,6 @@ def sign():
 
     return jsonify({"msg": "User created successfully!"}), 201
 
-
-
 @admin_bp.route('/signin', methods=['GET', 'POST'])
 def signin():
     email = request.json.get('email')
@@ -95,7 +93,7 @@ def signin():
 
     if user and check_password_hash(user.password, password):
         # Create JWT token
-        access_token = create_access_token(identity=user.id)
+        access_token = create_access_token(identity=str(user.id))  # Ensure identity is a string
 
         # Assuming the user has a relationship with roles, fetch the user's role(s)
         user_roles = [role.name for role in user.roles]  # Get list of role names
@@ -114,7 +112,7 @@ def view_all_orders():
     """
     API for admins to view all orders in the system, regardless of the user who created them.
     """
-    orders = Order.query.options(joinedload(Order.user)).all()
+    orders = Order.query.options(joinedload(Order.user)).filter(Order.deleted == False).all()
 
     if not orders:
         return jsonify([]), 200
@@ -132,11 +130,10 @@ def view_all_orders():
             "status": order.status,
             "execution_rate": order.execution_rate,  # Admin can see the execution rate
             "bank_name": order.bank_name,  # Admin can see the bank name
+            
         })
 
     return jsonify(order_list), 200
-
-    
 
 @admin_bp.route('api/orders/<int:order_id>', methods=['PUT'])
 @jwt_required()
@@ -156,348 +153,194 @@ def update_order(order_id):
     order.status = data.get("status", order.status)  # Update status
     order.execution_rate = data.get("execution_rate", order.execution_rate)  # Add/update execution rate
     order.bank_name = data.get("bank_name", order.bank_name)  # Add/update bank name
+    order.historical_loss=data.get("historical_loss", order.historical_loss)
     
     db.session.commit()  # Save changes
     
     return jsonify({"message": "Order updated successfully"}), 200
 
-"""
-@admin_bp.route('/run_matching', methods=['POST'])
-@jwt_required()
-@roles_required('Admin')  # Enforces Admin role
-
-def run_matching():
-   
-    try:
-        # Call the scheduled matching process
-        scheduled_matching(current_app)
-        return jsonify({'message': 'Matching process executed successfully'}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-def scheduled_matching(app):
-        today = datetime.now()
-        future_date = today + timedelta(days=2)
-
-        # Query the database for orders that meet the conditions
-        orders_query = Order.query.filter(func.date(Order.value_date) > future_date, Order.status == 'Pending').all()
-
-        # Delete pending orders that match the condition (value_date > future_date)
-        Order.query.filter(func.date(Order.value_date) > future_date, Order.status == 'Pending').delete()
-        db.session.commit()
-
-        orders_dicts = [
-            {
-                'ID': order.id,
-                'Type': order.transaction_type,
-                'Transaction Amount': order.amount,
-                'Currency': order.currency,
-                'Value Date': order.value_date,
-                'Order Dates': order.order_date,
-                'Bank Account': order.bank_account,
-                'reference': order.reference,
-                'Client': order.user,
-                'Status': order.status,
-                'Rating': order.rating
-            } for order in orders_query
-        ]
-
-        orders_df = pd.DataFrame(orders_dicts)
-
-        if len(orders_df) > 0:
-            orders_df['Value Date'] = pd.to_datetime(orders_df['Value Date'])
-            orders_df['Order Dates'] = pd.to_datetime(orders_df['Order Dates'])
-
-            matches = []
-            remaining = []
-            update_match = []
-
-            # Group by 'Value Date' and 'Currency'
-            for (value_date, currency), group in orders_df.groupby(['Value Date', 'Currency']):
-                buy_orders = group[group['Type'] == 'buy'].sort_values(by=['Rating', 'Order Dates', 'Transaction Amount'], ascending=[False, True, False])
-                sell_orders = group[group['Type'] == 'sell'].sort_values(by=['Rating', 'Order Dates', 'Transaction Amount'], ascending=[False, True, False])
-
-                buy_index, sell_index = 0, 0
-                while buy_index < len(buy_orders) and sell_index < len(sell_orders):
-                    buy_order = buy_orders.iloc[buy_index]
-                    sell_order = sell_orders.iloc[sell_index]
-                    match_amount = min(buy_order['Transaction Amount'], sell_order['Transaction Amount'])
-
-                    unique_key = generate_unique_key(buy_order['Client'], sell_order['Client'])
-
-                    match = {
-                        'ID': unique_key,
-                        'Value Date': value_date.strftime('%Y-%m-%d'),
-                        'Currency': currency,
-                        'Buyer': buy_order['Client'],
-                        'Buyer Rating': buy_order['Rating'],
-                        'Seller': sell_order['Client'],
-                        'Seller Rating': sell_order['Rating'],
-                        'Matched Amount': match_amount,
-                    }
-                    matches.append(match)
-
-                    # Update the transaction amount for matched orders
-                    buy_orders.at[buy_orders.index[buy_index], 'Transaction Amount'] -= match_amount
-                    sell_orders.at[sell_orders.index[sell_index], 'Transaction Amount'] -= match_amount
-
-                    # Update the status of the matched orders in the Order table
-                    buy_order_instance = Order.query.get(buy_order['ID'])  # Get buy order from the DB
-                    sell_order_instance = Order.query.get(sell_order['ID'])  # Get sell order from the DB
-
-                    # Update their statuses
-                    buy_order_instance.status = 'Matched'
-                    sell_order_instance.status = 'Matched'
-
-                    # Add them to the session for updating
-                    db.session.add(buy_order_instance)
-                    db.session.add(sell_order_instance)
-
-                    # Commit changes after processing each match
-                    db.session.commit()
-
-                    # Mark the orders as matched and adjust their transaction amount in a separate DataFrame
-                    matched_buy = buy_order.copy()
-                    matched_buy['Status'] = 'Matched'
-                    matched_buy['ID'] = unique_key
-                    matched_buy['Transaction Amount'] = match_amount
-                    update_match.append(matched_buy)
-
-                    matched_sell = sell_order.copy()
-                    matched_sell['Status'] = 'Matched'
-                    matched_sell['ID'] = unique_key
-                    matched_sell['Transaction Amount'] = match_amount
-                    update_match.append(matched_sell)
-
-                    # Move to the next order if the current one is fully matched
-                    if buy_orders.iloc[buy_index]['Transaction Amount'] == 0:
-                        buy_index += 1
-                    if sell_orders.iloc[sell_index]['Transaction Amount'] == 0:
-                        sell_index += 1
-
-                filtered_buy_orders = buy_orders[buy_orders['Transaction Amount'] > 0]
-                filtered_sell_orders = sell_orders[sell_orders['Transaction Amount'] > 0]
-                remaining_orders = pd.concat([filtered_buy_orders, filtered_sell_orders])
-                remaining_orders['Status'] = 'Market'
-                remaining.append(remaining_orders)
-
-            update_match_df = pd.DataFrame(update_match)
-            remaining_orders_df = pd.concat(remaining, ignore_index=True)
-            all_updates_df = pd.concat([update_match_df, remaining_orders_df], ignore_index=True)
-
-            for index, row in all_updates_df.iterrows():
-                new_order = Order(
-                    id_unique=str(row['ID']),
-                    transaction_type=row['Type'],
-                    amount=row['Transaction Amount'],
-                    currency=row['Currency'],
-                    value_date=row['Value Date'].to_pydatetime(),
-                    order_date=row['Order Dates'].to_pydatetime(),
-                    bank_account=row['Bank Account'],
-                    reference=row['reference'],
-                    user=row['Client'],
-                    status=row['Status'],
-                    rating=row.get('Rating', 0)
-                )
-                db.session.add(new_order)
-            db.session.commit()
-
-            for match in matches:
-                matched_order = MatchedPosition(
-                    id=str(match['ID']),
-                    value_date=datetime.strptime(match['Value Date'], '%Y-%m-%d').date(),
-                    currency=match['Currency'],
-                    buyer=match['Buyer'],
-                    buyer_rate=int(match['Buyer Rating']),
-                    seller=match['Seller'],
-                    seller_rate=int(match['Seller Rating']),
-                    matched_amount=float(match['Matched Amount'])
-                )
-                db.session.add(matched_order)
-
-            db.session.commit()
-
-        else:
-            print("No pending orders found for matching.")"""
-
 
 @admin_bp.route('/run_matching', methods=['POST'])
 @jwt_required()
-@roles_required('Admin')  # Enforces Admin role
+@roles_required('Admin')  
 def run_matching():
     """
     API to trigger the scheduled matching process manually.
     This allows Admins to run the matching process via a REST API call.
     """
     try:
-        # Call the matching function
-        manual_matching(current_app)
-        return jsonify({'message': 'Matching process executed successfully'}), 200
+        debug_messages = []  # List to capture debug messages
+        # Call the matching function and pass the debug list
+        process_matching_orders(current_app, debug_messages)
+        return jsonify({
+            'message': 'Matching process executed successfully',
+            'debug_messages': debug_messages  # Include debug messages in the response
+        }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+        
+def process_matching_orders(app, debug_messages):
+    """
+    Processes matching of pending orders by grouping them by value_date and currency,
+    and updates their statuses based on matching logic. Unmatched orders are marked as 'Market'.
+    """
+    try:
+        # Fetch Pending Orders
+        pending_orders = Order.query.filter_by(status='Pending', deleted=False).all()
+        if not pending_orders:
+            debug_messages.append("No pending orders found.")
+            return {"debug_messages": debug_messages, "message": "No pending orders to process."}
 
-def manual_matching(app):
-    with app.app_context():
-        today = datetime.now()
+        debug_messages.append(f"Fetched Pending Orders: {[order.id for order in pending_orders]}")
 
-        # Fetch orders that are pending and valid for matching
-        orders_query = Order.query.filter(
-            Order.status == 'Pending',
-            func.date(Order.value_date) >= today
-        ).all()
+        # Convert to DataFrame for easier processing
+        try:
+            data = [
+                {
+                    'id': order.id,
+                    'type': order.transaction_type,
+                    'amount': order.amount,
+                    'original_amount': order.original_amount,
+                    'currency': order.currency,
+                    'value_date': order.value_date,
+                    'order_date': order.order_date,
+                    'rating': order.rating
+                } for order in pending_orders
+            ]
+            df = pd.DataFrame(data)
+            debug_messages.append(f"Converted {len(data)} orders to DataFrame.")
+        except Exception as e:
+            debug_messages.append(f"Error converting orders to DataFrame: {e}")
+            return {"debug_messages": debug_messages, "message": "Failed to process orders."}
 
-        # Prepare order dictionaries
-        orders_dicts = [
-            {
-                'ID': order.id,
-                'Type': order.transaction_type,
-                'Transaction Amount': order.amount,  # This will be the remaining amount
-                'Currency': order.currency,
-                'Value Date': order.value_date,
-                'Order Dates': order.order_date,
-                'Bank Account': order.bank_account,
-                'reference': order.reference,
-                'Client': order.user.email,
-                'Status': order.status,
-                'Rating': order.rating
-            } for order in orders_query
-        ]
+        # Group by value_date and currency
+        try:
+            groups = df.groupby(['value_date', 'currency'])
+            debug_messages.append(f"Grouped orders into {len(groups)} groups.")
+        except Exception as e:
+            debug_messages.append(f"Error grouping orders: {e}")
+            return {"debug_messages": debug_messages, "message": "Failed to group orders."}
 
-        orders_df = pd.DataFrame(orders_dicts)
+        for (value_date, currency), group in groups:
+            debug_messages.append(f"Processing Group: Value Date={value_date}, Currency={currency}")
+            buy_orders = group[group['type'] == 'buy'].sort_values(by=['rating'], ascending=False)
+            sell_orders = group[group['type'] == 'sell'].sort_values(by=['rating'], ascending=True)
 
-        if len(orders_df) > 0:
-            # Proceed with matching logic
-            orders_df['Value Date'] = pd.to_datetime(orders_df['Value Date'])
-            orders_df['Order Dates'] = pd.to_datetime(orders_df['Order Dates'])
+            for _, buy_order in buy_orders.iterrows():
+                for _, sell_order in sell_orders.iterrows():
+                    if buy_order['amount'] <= 0:
+                        debug_messages.append(f"Buy Order ID={buy_order['id']} has no remaining amount to match.")
+                        break
+                    if sell_order['amount'] <= 0:
+                        debug_messages.append(f"Sell Order ID={sell_order['id']} has no remaining amount to match.")
+                        continue
 
-            matches = []
-            remaining = []
+                    # Match orders
+                    match_amount = min(buy_order['amount'], sell_order['amount'])
+                    buy_order['amount'] -= match_amount
+                    sell_order['amount'] -= match_amount
 
-            # Group by 'Value Date' and 'Currency'
-            for (value_date, currency), group in orders_df.groupby(['Value Date', 'Currency']):
-                buy_orders = group[group['Type'] == 'buy'].sort_values(
-                    by=['Rating', 'Order Dates', 'Transaction Amount'],
-                    ascending=[False, True, False]
-                )
-                sell_orders = group[group['Type'] == 'sell'].sort_values(
-                    by=['Rating', 'Order Dates', 'Transaction Amount'],
-                    ascending=[False, True, False]
-                )
+                    # Update database records
+                    try:
+                        buy = Order.query.get(buy_order['id'])
+                        sell = Order.query.get(sell_order['id'])
 
-                buy_index, sell_index = 0, 0
-                while buy_index < len(buy_orders) and sell_index < len(sell_orders):
-                    buy_order = buy_orders.iloc[buy_index]
-                    sell_order = sell_orders.iloc[sell_index]
-                    
-                    # Conversion to standard Python float here for match_amount calculation
-                    match_amount = min(float(buy_order['Transaction Amount']), float(sell_order['Transaction Amount']))
+                        if buy is None or sell is None:
+                            debug_messages.append(f"Error: Buy or Sell order not found for IDs: {buy_order['id']}, {sell_order['id']}.")
+                            continue
 
-                    # Create match record
-                    match = {
-                        'ID': buy_order['ID'],
-                        'Value Date': value_date.strftime('%Y-%m-%d'),
-                        'Currency': currency,
-                        'Buyer': buy_order['Client'],
-                        'Buyer Rating': buy_order['Rating'],
-                        'Seller': sell_order['Client'],
-                        'Seller Rating': sell_order['Rating'],
-                        'Matched Amount': match_amount,
-                    }
-                    matches.append(match)
+                        buy.amount = buy_order['amount']
+                        sell.amount = sell_order['amount']
 
-                    # Adjust transaction amounts with float conversion
-                    buy_orders.at[buy_orders.index[buy_index], 'Transaction Amount'] -= match_amount
-                    sell_orders.at[sell_orders.index[sell_index], 'Transaction Amount'] -= match_amount
+                        # Update matched amounts for both orders
+                        buy.matched_amount = (buy.matched_amount or 0) + match_amount
+                        sell.matched_amount = (sell.matched_amount or 0) + match_amount
 
-                    # Fetch order instances from the database
-                    buy_order_instance = Order.query.get(buy_order['ID'])
-                    sell_order_instance = Order.query.get(sell_order['ID'])
+                        # Set statuses based on remaining amounts
+                        if buy.amount == 0:
+                            buy.status = 'Matched'
+                            debug_messages.append(f"Buy Order ID={buy.id} fully matched and status updated to Matched.")
+                        else:
+                            buy.status = 'Market'
+                            debug_messages.append(f"Buy Order ID={buy.id} partially matched and status updated to Market.")
 
-                    if buy_order_instance is None or sell_order_instance is None:
-                        return jsonify({'error': 'Matching failed: Buy or Sell order not found'}), 400
+                        if sell.amount == 0:
+                            sell.status = 'Matched'
+                            debug_messages.append(f"Sell Order ID={sell.id} fully matched and status updated to Matched.")
+                        else:
+                            sell.status = 'Market'
+                            debug_messages.append(f"Sell Order ID={sell.id} partially matched and status updated to Market.")
 
-                    # Convert the amounts to Python float before updating the database
-                    buy_order_instance.amount = float(buy_orders.iloc[buy_index]['Transaction Amount'])
-                    sell_order_instance.amount = float(sell_orders.iloc[sell_index]['Transaction Amount'])
+                        # Link matched orders
+                        buy.matched_order_id = sell.id
+                        sell.matched_order_id = buy.id
 
-                    # Update the status if fully matched
-                    if buy_order_instance.amount == 0:
-                        buy_order_instance.status = 'Matched'
-                    if sell_order_instance.amount == 0:
-                        sell_order_instance.status = 'Matched'
+                        db.session.add(buy)
+                        db.session.add(sell)
 
-                    # Commit the changes to the database
-                    db.session.add(buy_order_instance)
-                    db.session.add(sell_order_instance)
-                    db.session.commit()
+                        debug_messages.append(
+                            f"Matched Buy ID={buy.id} (Remaining Amount={buy.amount}) with "
+                            f"Sell ID={sell.id} (Remaining Amount={sell.amount}) for Match Amount={match_amount}"
+                        )
+                    except Exception as e:
+                        debug_messages.append(f"Error updating database records for Buy ID={buy_order['id']} or Sell ID={sell_order['id']}: {e}")
 
-                    # Move to the next order if fully matched
-                    if buy_orders.iloc[buy_index]['Transaction Amount'] == 0:
-                        buy_index += 1
-                    if sell_orders.iloc[sell_index]['Transaction Amount'] == 0:
-                        sell_index += 1
+            # Update unmatched orders to 'Market' status
+            try:
+                for _, unmatched_order in group[group['amount'] > 0].iterrows():
+                    unmatched = Order.query.get(unmatched_order['id'])
+                    if unmatched and unmatched.status == 'Pending':
+                        unmatched.status = 'Market'
+                        db.session.add(unmatched)
+                        debug_messages.append(f"Unmatched Order ID={unmatched.id} marked as Market.")
+            except Exception as e:
+                debug_messages.append(f"Error updating unmatched orders in group Value Date={value_date}, Currency={currency}: {e}")
 
-                # Handle remaining unmatched orders
-                filtered_buy_orders = buy_orders[buy_orders['Transaction Amount'] > 0]
-                filtered_sell_orders = sell_orders[sell_orders['Transaction Amount'] > 0]
-                remaining_orders = pd.concat([filtered_buy_orders, filtered_sell_orders])
-
-                if not remaining_orders.empty:
-                    remaining_orders['Status'] = 'Market'
-
-                    # Update the status and remaining amount of unmatched orders in the database
-                    for _, remaining_order in remaining_orders.iterrows():
-                        order_instance = Order.query.get(remaining_order['ID'])
-                        if order_instance:
-                            order_instance.status = 'Market'
-                            # Ensure we store Python float
-                            order_instance.amount = float(remaining_order['Transaction Amount'])
-                            db.session.add(order_instance)
-
-                    db.session.commit()
-                    remaining.append(remaining_orders)
-
-            # Update MatchedPosition table with matched orders
-            for match in matches:
-                matched_order = MatchedPosition(
-                    id=str(match['ID']),
-                    value_date=datetime.strptime(match['Value Date'], '%Y-%m-%d').date(),
-                    currency=match['Currency'],
-                    buyer=match['Buyer'],
-                    buyer_rate=int(match.get('Buyer Rating', 0)),
-                    seller=match['Seller'],
-                    seller_rate=int(match.get('Seller Rating', 0)),
-                    matched_amount=float(match['Matched Amount']),
-                    buy_order_id=Order.query.get(match['ID']).id,
-                    sell_order_id=Order.query.get(match['ID']).id
-                )
-                db.session.add(matched_order)
-
+        # Commit all changes
+        try:
             db.session.commit()
+            debug_messages.append("All changes committed to the database successfully.")
+        except Exception as e:
+            db.session.rollback()
+            debug_messages.append(f"Error committing changes to the database: {e}")
+            return {"debug_messages": debug_messages, "message": "Failed to commit changes to the database."}
 
+        return {"debug_messages": debug_messages, "message": "Matching process executed successfully"}
 
-
+    except Exception as e:
+        db.session.rollback()
+        debug_messages.append(f"Unexpected error: {str(e)}")
+        return {"debug_messages": debug_messages, "message": "Matching process failed due to an unexpected error."}
+     
 
 @admin_bp.route('/matched_orders', methods=['GET'])
 @jwt_required()
 @roles_required('Admin')
 def view_matched_orders():
-    """
-    API to view all matched orders in the system.
-    """
-    matched_orders = MatchedPosition.query.all()
+    # Query orders with status 'Matched'
+    matched_orders = Order.query.filter(Order.status == 'Matched').all()
 
     # Prepare the list of matched orders to return
     order_list = []
     for order in matched_orders:
+        # Check for matched_order_id to determine the linked order
+        matched_order = Order.query.get(order.matched_order_id) if order.matched_order_id else None
+        
+        # Add order details
         order_list.append({
             "id": order.id,
-            "buyer": order.buyer,
-            "seller": order.seller,
+            "buyer": order.user.email if order.transaction_type == 'buy' else (matched_order.user.email if matched_order else None),
+            "seller": order.user.email if order.transaction_type == 'sell' else (matched_order.user.email if matched_order else None),
             "currency": order.currency,
             "matched_amount": order.matched_amount,
+            "amount": order.original_amount,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
+            "status": order.status,
+            "execution_rate": order.execution_rate or "",  # Empty string if None
+            "bank_name": order.bank_name or "",  # Empty string if None
+            "value_date": order.value_date.strftime("%Y-%m-%d"),
+            "order_date": order.order_date.strftime("%Y-%m-%d"),
         })
 
     return jsonify(order_list), 200
@@ -512,7 +355,7 @@ def view_market_orders():
     """
     try:
         # Fetch all orders with status 'Market'
-        market_orders = Order.query.filter(Order.status.in_(['Market', 'Executed'])).all()
+        market_orders = Order.query.filter(Order.status.in_(['Market', 'Executed']),Order.deleted == False).all()
 
         if not market_orders:
             return jsonify([]), 200
@@ -542,85 +385,6 @@ def view_market_orders():
 def register_admin_jobs(scheduler, app):
     scheduler.add_job(scheduled_matching, 'cron', hour=16, minute=14, args=[app])
 
-
-# Helper function to calculate forward rate
-def calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days):
-    return spot_rate * ((1 + yield_domestic  * days / 360) / (1 + yield_foreign * days / 360))
-
-
-# VaR table based on currency, period, and alpha level
-var_table = {
-    'USD': {
-        '1m': {'1%': -0.038173, '5%': -0.026578, '10%': -0.020902},
-        '3m': {'1%': -0.081835, '5%': -0.062929, '10%': -0.048737},
-        '6m': {'1%': -0.200238, '5%': -0.194159, '10%': -0.186580}
-    },
-    'EUR': {
-        '1m': {'1%': -0.188726, '5%': -0.176585, '10%': -0.160856},
-        '3m': {'1%': -0.187569, '5%': -0.180371, '10%': -0.174856},
-        '6m': {'1%': -0.199737, '5%': -0.192892, '10%': -0.185136}
-    }
-}
-
-# Helper function to determine yield period 
-def get_yield_period(days):
-    if days <= 60:
-        return '1m'
-    elif days <= 120:
-        return '3m'
-    else:
-        return '6m'
-
-# calculate VaR based on currency, days, and amount
-def calculate_var(currency, days, amount):
-
-    # Determine the correct time period for VaR (1m, 3m, or 6m)
-    period = get_yield_period(days)
-    
-    # Retrieve the correct VaR rates for the currency and period
-    currency_var = var_table.get(currency.upper(), {}).get(period, {})
-    
-    # Calculate the Value at Risk for each confidence level
-    var_1 = currency_var.get('1%', 0.0) * abs(amount)
-    var_5 = currency_var.get('5%', 0.0) * abs(amount)
-    var_10 = currency_var.get('10%', 0.0) * abs(amount)
-    
-    return {'1%': var_1, '5%': var_5, '10%': var_10}
-
-
-# API to calculate VaR for each order
-@admin_bp.route('/api/calculate-var', methods=['GET'])
-def calculate_var_api():
-    try:
-        # Load orders
-        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
-        today = datetime.today().date()
-        var_calculations = []
-
-        for _, order in orders.iterrows():
-            currency = order['currency']
-            amount = abs(order['amount'])
-            order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = (today - order_date).days  # Calculate days from order's value date to today
-            
-            # Directly use `calculate_var` to get VaR values for each level
-            var_values = calculate_var(currency, days_diff, amount)
-
-            var_calculations.append({
-                "Value Date": order_date.isoformat(),
-                "Days": days_diff,
-                "VaR 1%": var_values['1%'],
-                "VaR 5%": var_values['5%'],
-                "VaR 10%": var_values['10%']
-            })
-
-        return jsonify(var_calculations), 200
-
-    except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
-    
-
-
 @admin_bp.route('/upload-file', methods=['POST'])
 def upload_file():
     file = request.files['file']
@@ -632,43 +396,48 @@ def upload_file():
     return jsonify({"message": "File uploaded successfully"}), 200
 
 
-@admin_bp.route('/api/calculate-forward-rate', methods=['GET'])
-def calculate_forward_rate_api():
-    try:
-        # Load exchange data and orders
-        df = pd.read_sql('SELECT * FROM exchange_data', db.engine)
-        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
+@admin_bp.route('/logs', methods=['GET'])
+@jwt_required()
+@roles_required('Admin')  # Restrict access to admins only
+def get_logs():
+    """
+    API to retrieve audit logs. Allows filtering by action type, table name, user ID, and date range.
+    """
+    # Get filters from query parameters
+    action_type = request.args.get('action_type')
+    table_name = request.args.get('table_name')
+    user_id = request.args.get('user_id')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
 
-        today = datetime.today().date()
-        today_data = df[df['Date'] == today]
-        forward_rates = []
+    # Start query with all logs
+    query = AuditLog.query
 
-        if today_data.empty:
-            return jsonify({"error": "No exchange data found for today's date"}), 404
+    # Apply filters if provided
+    if action_type:
+        query = query.filter(AuditLog.action_type == action_type)
+    if table_name:
+        query = query.filter(AuditLog.table_name == table_name)
+    if user_id:
+        query = query.filter(AuditLog.user_id == user_id)
+    if start_date:
+        query = query.filter(AuditLog.timestamp >= datetime.strptime(start_date, "%Y-%m-%d"))
+    if end_date:
+        query = query.filter(AuditLog.timestamp <= datetime.strptime(end_date, "%Y-%m-%d"))
 
-        for _, order in orders.iterrows():
-            currency = order['currency']
-            order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = (today - order_date).days  # Calculate days from order's value date to today
+    # Execute query and retrieve logs
+    logs = query.order_by(AuditLog.timestamp.desc()).all()
 
-            try:
-                # Retrieve today's spot rate and yield values for the currency and TND
-                spot_rate = today_data[f'Spot {currency.upper()}'].values[0]
-                yield_foreign = today_data[f'{get_yield_period(days_diff).upper()} {currency.upper()}'].values[0]
-                yield_domestic = today_data[f'{get_yield_period(days_diff).upper()} TND'].values[0]
-            except KeyError as e:
-                print(f"Missing required field in exchange data: {str(e)}")
-                continue
+    # Format logs for JSON response
+    log_list = [{
+        "id": log.id,
+        "action_type": log.action_type,
+        "table_name": log.table_name,
+        "record_id": log.record_id,
+        "user_id": log.user_id,
+        "user_email": log.user.email if log.user else "Unknown",
+        "timestamp": log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "details": log.details
+    } for log in logs]
 
-            # Calculate the forward rate
-            forward_rate = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
-            forward_rates.append({
-                "Value Date": order_date.isoformat(),
-                "Days": days_diff,
-                "Forward Rate": forward_rate
-            })
-
-        return jsonify(forward_rates), 200
-
-    except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+    return jsonify(log_list), 200

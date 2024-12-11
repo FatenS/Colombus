@@ -2,7 +2,7 @@ from flask import Flask
 from flask_cors import CORS
 from models import db, User, Role
 from admin.routes import admin_bp, register_admin_jobs
-from user.routes import user_bp, register_user_jobs, init_socketio, register_live_rates
+from user.routes import user_bp, init_socketio
 from scheduler import scheduler, start_scheduler
 from flask_security import Security, SQLAlchemySessionUserDatastore
 from flask_jwt_extended import JWTManager
@@ -34,8 +34,6 @@ security = Security(app, user_datastore)
 
 # Register background jobs and socket connections
 register_admin_jobs(scheduler, app)
-register_user_jobs(scheduler, app)
-register_live_rates(scheduler, app)
 start_scheduler()
 socketio = init_socketio(app)
 
