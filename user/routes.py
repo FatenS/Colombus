@@ -15,10 +15,9 @@ from .services.live_rates_service import update_currency_rates, rates, metric, r
 from .services.meeting_service import MeetingService
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from io import BytesIO
-from datetime import datetime, timezone
 import json
-
-
+import requests
+from bs4 import BeautifulSoup
 
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
                     template_folder='templates')
@@ -641,19 +640,22 @@ def process_uploaded_file(file_stream, user):
         for index, row in uploaded_data.iterrows():
             try:
                 # Assuming the template has these columns: 'Value Date', 'Currency', 'Amount', 'Transaction Type'
+                transaction_date = convert_to_date(row['Transaction Date'])
                 value_date = convert_to_date(row['Value Date'])
                 currency = row['Currency']
                 amount = row['Amount']
                 transaction_type = row['Transaction Type']
-
+                interbank_rate = row['Interbancaire']
                 # Create a new order with both amount and original_amount set to the uploaded amount
                 new_order = Order(
                     value_date=value_date,
+                    transaction_date=transaction_date, 
                     currency=currency,
                     amount=amount,  # Current amount, used in matching
-                    original_amount=amount,  # Fixed original amount for client view
+                    original_amount=amount,  
                     transaction_type=transaction_type,
-                    status='Pending',
+                    interbank_rate=interbank_rate,
+                    status='Market',
                     user=user,
                     order_date=datetime.now()
                 )
@@ -667,7 +669,7 @@ def process_uploaded_file(file_stream, user):
         log_action(
             action_type='bulk_upload',
             table_name='order',
-            record_id=None,  # No single record ID for bulk actions
+            record_id=-1,   # No single record ID for bulk actions
             user_id=user.id,
             details={"uploaded_orders": len(uploaded_data)}
         )
@@ -759,7 +761,7 @@ def calculate_var_api():
             currency = order['currency']
             amount = abs(order['amount'])
             order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = (today - order_date).days  # Calculate days from order's value date to today
+            days_diff = ( today - order_date ).days  # Calculate days from order's value date to today
             
             # Directly use `calculate_var` to get VaR values for each level
             var_values = calculate_var(currency, days_diff, amount)
@@ -795,7 +797,7 @@ def calculate_forward_rate_api():
         for _, order in orders.iterrows():
             currency = order['currency']
             order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = (today - order_date).days  # Calculate days from order's value date to today
+            days_diff = ( order_date -today ).days  # Calculate days from order's value date to today
 
             try:
                 # Retrieve today's spot rate and yield values for the currency and TND
@@ -819,9 +821,6 @@ def calculate_forward_rate_api():
     except Exception as e:
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
     
-
-
-
 @user_bp.route('/api/dashboard/summary', methods=['GET'])
 @jwt_required()
 def dashboard_summary():
@@ -845,28 +844,65 @@ def dashboard_summary():
     )
     coverage_percent = (total_covered / total_traded * 100) if total_traded > 0 else 0
 
-    # Economies calculations
+    # -------------------------------------------------------
+    # FIX: Distinguish Import vs. Export in Gains calculations
+    # -------------------------------------------------------
+    # Gains in foreign currency (USD, etc.)
     economies_totales = sum(
-        (calculate_benchmark(order) / order.execution_rate - 1) * order.original_amount
+        (
+            (
+                (calculate_benchmark(order) / order.execution_rate) - 1  # Import formula
+                if order.transaction_type.lower() in ["import", "buy"]
+                else
+                (order.execution_rate / calculate_benchmark(order)) - 1  # Export formula
+            )
+        ) * order.original_amount
         for order in orders
         if order.execution_rate is not None
-    )
-    economies_totales_couverture = sum(
-        (calculate_benchmark(order) / order.execution_rate - 1) * order.original_amount
-        for order in orders
-        if order.execution_rate is not None and calculate_hedge_status(order.transaction_date, order.value_date) == "Yes"
     )
 
-    # Convert values to TND using execution_rate
+    economies_totales_couverture = sum(
+        (
+            (
+                (calculate_benchmark(order) / order.execution_rate) - 1
+                if order.transaction_type.lower() in ["import", "buy"]
+                else
+                (order.execution_rate / calculate_benchmark(order)) - 1
+            )
+        ) * order.original_amount
+        for order in orders
+        if order.execution_rate is not None 
+           and calculate_hedge_status(order.transaction_date, order.value_date) == "Yes"
+    )
+
+    # Gains in TND (multiply Gains in foreign by order.execution_rate)
     economies_totales_tnd = sum(
-        (calculate_benchmark(order) / order.execution_rate - 1) * order.original_amount * order.execution_rate
+        (
+            (
+                (calculate_benchmark(order) / order.execution_rate) - 1
+                if order.transaction_type.lower() in ["import", "buy"]
+                else
+                (order.execution_rate / calculate_benchmark(order)) - 1
+            )
+        ) * order.original_amount
+        * order.execution_rate  # Convert Gains to TND
         for order in orders
         if order.execution_rate is not None
     )
+
     economies_totales_couverture_tnd = sum(
-        (calculate_benchmark(order) / order.execution_rate - 1) * order.original_amount * order.execution_rate
+        (
+            (
+                (calculate_benchmark(order) / order.execution_rate) - 1
+                if order.transaction_type.lower() in ["import", "buy"]
+                else
+                (order.execution_rate / calculate_benchmark(order)) - 1
+            )
+        ) * order.original_amount
+        * order.execution_rate
         for order in orders
-        if order.execution_rate is not None and calculate_hedge_status(order.transaction_date, order.value_date) == "Yes"
+        if order.execution_rate is not None 
+           and calculate_hedge_status(order.transaction_date, order.value_date) == "Yes"
     )
 
     # Calculate superformance rate
@@ -877,19 +913,19 @@ def dashboard_summary():
     import calendar
 
     monthly_data = defaultdict(lambda: {"monthlyTotalTransacted": 0, "monthlyTotalGain": 0})
-
     for order in orders:
-        # Get the month name from the value_date
         month_name = calendar.month_name[order.value_date.month]
-        # Calculate total transacted for the month
         monthly_data[month_name]["monthlyTotalTransacted"] += order.original_amount
 
-        # Calculate gain for the month
+        # Here again, fix the Gains formula inline
         if order.execution_rate is not None:
-            benchmark = calculate_benchmark(order)
-            monthly_data[month_name]["monthlyTotalGain"] += (
-                (benchmark / order.execution_rate - 1) * order.original_amount
+            gain_percent = (
+                (calculate_benchmark(order) / order.execution_rate) - 1
+                if order.transaction_type.lower() in ["import", "buy"]
+                else
+                (order.execution_rate / calculate_benchmark(order)) - 1
             )
+            monthly_data[month_name]["monthlyTotalGain"] += (gain_percent * order.original_amount)
 
     # Prepare chart data
     months = list(monthly_data.keys())
@@ -900,7 +936,6 @@ def dashboard_summary():
         data["monthlyTotalGain"] for data in monthly_data.values()
     ]
 
-    # Prepare response data
     summary_data = {
         "currency": currency,
         "total_traded": total_traded,
@@ -917,6 +952,7 @@ def dashboard_summary():
     }
 
     return jsonify(summary_data)
+
 
 
 
@@ -960,30 +996,25 @@ def forward_rate_table():
 @user_bp.route('/api/dashboard/superperformance-trend', methods=['GET'])
 @jwt_required()  # Ensure the user is authenticated
 def superperformance_trend():
-    # Get the current user's ID from the JWT token
     user_id = get_jwt_identity()
-
-    # Get the currency from query parameters (default to USD)
     currency = request.args.get("currency", "USD").upper()
 
-    # Fetch all import orders for the logged-in user (executed or matched)
     orders = Order.query.filter(
         Order.user_id == user_id,
         Order.currency == currency,
-        Order.transaction_type.in_(['Import', 'buy']),  # Import-related orders
+        Order.transaction_type.in_(['Import', 'buy']),
         Order.status.in_(['Executed', 'Matched'])
     ).order_by(Order.transaction_date).all()
 
     if not orders:
         return jsonify({"message": "No data available for this user"}), 200
 
-    # Prepare trend data
     trend_data = []
     for order in orders:
         trend_data.append({
             "date": order.transaction_date.strftime('%Y-%m-%d'),
             "execution_rate": order.execution_rate,
-            "interbank_rate": order.interbank_rate,  # Assuming interbank_rate exists in your model
+            "interbank_rate": order.interbank_rate  # Already updated in the database
         })
 
     return jsonify(trend_data), 200
@@ -1019,7 +1050,7 @@ def bank_gains():
     currency = request.args.get("currency", "USD").upper()
 
     # Filter orders by currency
-    orders = Order.query.filter_by(user_id=user_id,currency=currency).all()
+    orders = Order.query.filter_by(user_id=user_id, currency=currency).all()
 
     # Group data by bank and month
     bank_data = {}
@@ -1045,8 +1076,19 @@ def bank_gains():
         if hedge_status == "Yes":
             bank_data[bank][month]['coverage'] += order.original_amount
 
+        # ---------------------------------------------
+        # FIX: Distinguish import/buy vs. export/sell
+        # ---------------------------------------------
         if benchmark and order.execution_rate:
-            bank_data[bank][month]['gain'] += (benchmark / order.execution_rate - 1) * order.original_amount
+            tx_type = order.transaction_type.lower()
+            if tx_type in ["import", "buy"]:
+                # Gains% = (Benchmark / ExecRate) - 1
+                gain_percent = (benchmark / order.execution_rate) - 1
+            else:
+                # Gains% = (ExecRate / Benchmark) - 1
+                gain_percent = (order.execution_rate / benchmark) - 1
+            
+            bank_data[bank][month]['gain'] += gain_percent * order.original_amount
 
     # Format data for the table
     formatted_data = []
@@ -1058,7 +1100,7 @@ def bank_gains():
                 "month": month,
                 "total_traded": stats['traded'],
                 "coverage_percent": coverage_percent,
-                "gain": stats['gain']
+                "gain": stats['gain']  # Gains in foreign currency if ExecRate is TND/FC
             })
 
     return jsonify(formatted_data)
@@ -1119,8 +1161,46 @@ def calculate_benchmark(order):
             raise ValueError(f"Missing yield data for {yield_period} and currency {order.currency}: {e}")
 
         # Calculate forward rate factor
-        forward_rate_factor = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
-        return base_benchmark * forward_rate_factor
+        forward_rate_factor = calculate_forward_rate(base_benchmark, yield_foreign, yield_domestic, days_diff)
+        return  forward_rate_factor
 
     # Return the base benchmark for non-hedged transactions
     return base_benchmark
+
+
+
+@user_bp.route('/update-interbank-rates', methods=['POST'])
+def update_interbank_rates():
+    try:
+        update_order_interbank_rates()  
+        return jsonify({'message': 'Interbank rates updated successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def update_order_interbank_rates():
+    # Fetch orders and their respective transaction dates and currencies
+    orders = Order.query.all()
+    for order in orders:
+        rate = fetch_rate_for_date_and_currency(order.transaction_date, order.currency)
+        if rate:
+            order.interbank_rate = rate
+            db.session.add(order)
+        db.session.commit()
+
+def fetch_rate_for_date_and_currency(date, currency):
+    formatted_date = date.strftime('%Y-%m-%d')
+    response = requests.post(f"https://www.bct.gov.tn/bct/siteprod/cours_archiv.jsp?input={formatted_date}&langue=en")
+    soup = BeautifulSoup(response.content, 'html.parser')
+    rate = None
+    # Parsing logic specifically tailored for the structure of the BCT site
+    rows = soup.find_all('tr')
+    for row in rows:
+        cells = row.find_all('td')
+        if cells and cells[1].get_text(strip=True).lower() == currency.lower():
+            rate = float(cells[3].get_text(strip=True).replace(',', '.'))
+            break
+    return rate
+
+
+

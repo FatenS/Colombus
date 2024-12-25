@@ -205,7 +205,8 @@ def process_matching_orders(app, debug_messages):
                     'currency': order.currency,
                     'value_date': order.value_date,
                     'order_date': order.order_date,
-                    'rating': order.rating
+                    'rating': order.rating,
+                    'user_id': order.user_id 
                 } for order in pending_orders
             ]
             df = pd.DataFrame(data)
@@ -235,7 +236,9 @@ def process_matching_orders(app, debug_messages):
                     if sell_order['amount'] <= 0:
                         debug_messages.append(f"Sell Order ID={sell_order['id']} has no remaining amount to match.")
                         continue
-
+                    if buy_order['user_id'] == sell_order['user_id']:
+                        
+                        continue
                     # Match orders
                     match_amount = min(buy_order['amount'], sell_order['amount'])
                     buy_order['amount'] -= match_amount
