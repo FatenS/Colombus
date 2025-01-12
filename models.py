@@ -23,6 +23,7 @@ class User(db.Model, UserMixin):
     email = db.Column(db.String, nullable=False, unique=True)
     password = db.Column(db.String(255), nullable=False)
     active = db.Column(db.Boolean(), nullable=True)
+    client_name = db.Column(db.String(255), nullable=False)  # Add client name here
     rating = db.Column(db.Integer, nullable=False, default=0)  
     roles = db.relationship('Role', secondary=roles_users, backref='roled')
     fs_uniquifier: Mapped[str] = db.Column(String(64), unique=True, nullable=True, default=lambda: str(uuid.uuid4()))
@@ -48,12 +49,18 @@ class BankAccount(db.Model):
     user = db.relationship('User', backref='bank_accounts', lazy=True)
 
 class OpenPosition(db.Model):
+    __tablename__ = 'open_position'
+
     id = db.Column(db.Integer, primary_key=True)
-    value_date = db.Column(db.Date, nullable=False, index=True)
-    currency = db.Column(db.String(3), nullable=False, index=True)
-    fx_amount = db.Column(db.Float, nullable=False)
-    type = db.Column(db.String(50), nullable=False)
-    user = db.Column(db.String(120), nullable=False)
+    id_unique = db.Column(db.String(80), nullable=False, default=lambda: str(uuid.uuid4()))
+    value_date = db.Column(db.Date, nullable=False)
+    currency = db.Column(db.String(3), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    transaction_type = db.Column(db.String(50), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    user = db.relationship('User', backref='open_positions', lazy=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
 
 class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -71,7 +78,7 @@ class Order(db.Model):
     status = db.Column(Enum('Pending', 'Executed', 'Market','Cancelled', 'Matched', name='order_status'), nullable=False, default='Pending')
     rating = db.Column(db.Integer)
     deleted = db.Column(db.Boolean, default=False, nullable=False)
-    historical_loss = db.Column(db.Float, nullable=True, default=0.02)
+    historical_loss = db.Column(db.Float, nullable=True)
     interbank_rate = db.Column(db.Float, nullable=True, default=None)
     execution_rate = db.Column(db.Float, nullable=True, default=None)
     bank_name = db.Column(db.String(100), nullable=True, default=None)
@@ -126,3 +133,27 @@ class AuditLog(db.Model):
     details = db.Column(db.Text)  # JSON string 
 
     user = db.relationship('User', backref='audit_logs')
+
+
+class YieldsData(db.Model):
+    __tablename__ = 'yields_data'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, index=True, unique=True)
+
+    # TND yields (we will treat TND1M, TND6M, TND9M as the same if TNDOND is identical)
+    tnd_1m = db.Column(db.Float, nullable=True)
+    tnd_6m = db.Column(db.Float, nullable=True)
+    tnd_9m = db.Column(db.Float, nullable=True)
+
+    # EUR yields
+    eur_1m = db.Column(db.Float, nullable=True)
+    eur_6m = db.Column(db.Float, nullable=True)
+    eur_9m = db.Column(db.Float, nullable=True)
+
+    # USD yields
+    usd_1m = db.Column(db.Float, nullable=True)
+    usd_6m = db.Column(db.Float, nullable=True)
+    usd_9m = db.Column(db.Float, nullable=True)
+
+    def __repr__(self):
+        return f"<YieldsData {self.date} TND1M={self.tnd_1m} ...>"

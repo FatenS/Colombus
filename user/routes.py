@@ -1,6 +1,5 @@
-from datetime import datetime, timedelta
-from models import db, User, BankAccount, Order, Meeting,AuditLog, ExchangeData
-from flask_login import login_user, LoginManager, logout_user
+from datetime import datetime, timedelta, date
+from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition
 from matplotlib import pyplot as plt
 import numpy as np
 from flask import render_template, request, redirect, url_for, session, jsonify, Blueprint, flash, send_from_directory
@@ -8,16 +7,15 @@ import pandas as pd
 import uuid
 from flask_socketio import SocketIO
 from .utils import convert_to_date, allowed_file
-from .services.bank_service import BankService
-from .services.user_service import UserService
-from .services.order_service import OrderService
 from .services.live_rates_service import update_currency_rates, rates, metric, rates_all, lastUpdated, socketio
-from .services.meeting_service import MeetingService
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from io import BytesIO
 import json
 import requests
 from bs4 import BeautifulSoup
+from apscheduler.schedulers.background import BackgroundScheduler
+
+
 
 user_bp = Blueprint('user_bp', __name__, static_folder='static', static_url_path='/static/user_bp',
                     template_folder='templates')
@@ -196,20 +194,6 @@ def load_and_process_data(currency='USD'):
 
 # =========== Dashboard ==============================
 
-@user_bp.route('/upload', methods=['POST'])
-def upload():
-    from services.file_handler import process_uploaded_file
-    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
-        flash('Please upload a valid file!')
-        return redirect(request.url)
-    
-    file = request.files['file']
-    try:
-        process_uploaded_file(file.stream)
-        return redirect(url_for('user_bp.dashboard', error='File uploaded and processed successfully'))
-    except Exception as e:
-        flash(f'Error processing file: {str(e)}')
-        return redirect(url_for('user_bp.dashboard'))
 
 @user_bp.route('/download-template-sec')
 def download_template_sec():
@@ -290,63 +274,137 @@ def save_data():
     headers = request_data['headers']
     return jsonify({'message': 'We will contact you soon.'})
 
+# ============ Openpositions Routes ==================
+@user_bp.route('/upload-open-positions', methods=['POST'])
+@jwt_required()
+def upload_open_positions():
+    """
+    API for clients to upload open positions in bulk via an Excel file.
+    """
+    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
+        return jsonify({'error': 'Invalid file format'}), 400
+
+    file = request.files['file']
+
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+
+        file_stream = file.stream
+        file_stream.seek(0)
+        bytes_io = BytesIO(file_stream.read())
+        uploaded_data = pd.read_excel(bytes_io)
+
+        for index, row in uploaded_data.iterrows():
+            # Example columns: 'Value Date', 'Currency', 'Amount', 'Transaction Type'
+            value_date = convert_to_date(row['Value Date'])
+            currency = row['Currency']
+            amount = row['Amount']
+            transaction_type = row['Transaction Type']
+
+            new_open_pos = OpenPosition(
+                value_date=value_date,
+                currency=currency,
+                amount=amount,
+                transaction_type=transaction_type,
+                user=user
+            )
+            db.session.add(new_open_pos)
+
+        db.session.commit()
+
+        # Optionally log action
+        log_action(
+            action_type='bulk_upload',
+            table_name='open_position',
+            record_id=-1,
+            user_id=user_id,
+            details={"uploaded_open_positions": len(uploaded_data)}
+        )
+
+        return jsonify({'message': f'{len(uploaded_data)} open positions uploaded'}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+    
+@user_bp.route('/open-positions', methods=['GET'])
+@jwt_required()
+def get_open_positions():
+    """
+    Returns the list of open positions for the logged-in user.
+    """
+    try:
+        user_id = get_jwt_identity()
+        open_positions = OpenPosition.query.filter_by(user_id=user_id).all()
+
+        # Transform each record into JSON
+        data = []
+        for pos in open_positions:
+            data.append({
+                "id": pos.id,
+                "value_date": pos.value_date.strftime('%Y-%m-%d'),  # convert date to string
+                "currency": pos.currency,
+                "amount": pos.amount,
+                "transaction_type": pos.transaction_type,
+                # add any other fields you want to expose
+            })
+
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-# ================= Bank Accounts ========================
+@user_bp.route('/convert-open-position/<int:open_position_id>', methods=['POST'])
+@jwt_required()
+def convert_open_position(open_position_id):
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
 
-@user_bp.route('/bank')
-def bank():
-    session_user = session.get('username')
-    if not session_user:
-        return redirect(url_for('login'))
+        open_pos = OpenPosition.query.get_or_404(open_position_id)
 
-    bank_data = BankService.get_bank_data(session_user)
-    return render_template('Bank.html', **bank_data)
+        # Create an Order with the data from the OpenPosition
+        new_order = Order(
+            value_date=open_pos.value_date,
+            currency=open_pos.currency,
+            amount=open_pos.amount,
+            original_amount=open_pos.amount,
+            transaction_type=open_pos.transaction_type,
+            user_id=open_pos.user_id,  # or user_id if you want to reassign
+            transaction_date=datetime.now(),
+            order_date=datetime.now(),
+            status='Market',  # or 'Pending' or whatever default
+        )
+        db.session.add(new_order)
 
-@user_bp.route('/add_account', methods=['POST'])
-def add_account():
-    form_data = request.form
-    BankService.add_new_account(form_data, session['username'])
-    return redirect(url_for('user_bp.bank'))
+        # Optionally remove the open position or set a 'converted' flag
+        db.session.delete(open_pos)
+        # or: open_pos.status = 'Converted'
 
-@user_bp.route('/details/<int:account_id>', methods=['GET'])
-def get_account_details(account_id):
-    return BankService.get_account_details(account_id)
+        db.session.commit()
 
-@user_bp.route('/bank-accounts/<account_id>', methods=['PUT'])
-def update_bank_account(account_id):
-    data = request.get_json()
-    return BankService.update_bank_account(account_id, data)
+        # Log action
+        log_action(
+            action_type='convert_open_position',
+            table_name='open_position',
+            record_id=open_position_id,
+            user_id=user_id,
+            details={"message": "Converted open_position to Order"}
+        )
 
-@user_bp.route('/bank-accounts/<account_id>', methods=['DELETE'])
-def delete_bank_account(account_id):
-    return BankService.delete_bank_account(account_id)
+        return jsonify({'message': 'Open position converted to Order'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
 
-
-# ======================================= book meeting ======================== 
-@user_bp.route('/book_demo', methods=['GET', 'POST'])
-def book_demo():
-    if request.method == 'POST':
-        form_data = {
-            'name': request.form.get('name'),
-            'rep': request.form.get('rep'),
-            'position': request.form.get('position'),
-            'email': request.form.get('email'),
-            'date': request.form.get('date'),
-            'time': request.form.get('time'),
-            'notes': request.form.get('notes', '')
-        }
-
-        try:
-            message = MeetingService.book_meeting(form_data)
-            flash(message)
-            return redirect(url_for('user_bp.home'))
-        except Exception as e:
-            flash(f'Error booking meeting: {str(e)}')
-            return redirect(request.url)
-    else:
-        return render_template('book_demo.html')  # Ensure this template exists
-
+def delete_expired_positions(app):
+    with app.app_context():
+        today = date.today()
+        expired_positions = OpenPosition.query.filter(OpenPosition.value_date < today).all()
+        for pos in expired_positions:
+            db.session.delete(pos)
+        db.session.commit()
 # ============ Order Routes ==================
 @user_bp.route('/orders', methods=['POST'])
 @jwt_required()
@@ -486,6 +544,7 @@ def view_orders():
             "currency": order.currency,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
             "status": order.status,
+            "client_name": order.user.client_name
         })
     
     return jsonify(order_list), 200
@@ -500,6 +559,8 @@ def log_action(action_type, table_name, record_id, user_id, details):
     :param user_id: The ID of the user performing the action
     :param details: JSON object of the changes (old and new values)
     """
+    user = User.query.get(user_id)
+    details["client_name"] = user.client_name  
     log_entry = AuditLog(
         action_type=action_type,
         table_name=table_name,
@@ -750,24 +811,28 @@ def calculate_var(currency, days, amount):
 
 # API to calculate VaR for each order
 @user_bp.route('/api/calculate-var', methods=['GET'])
-def calculate_var_api():
+def calculate_var_openpositions_api():
     try:
-        # Load orders
-        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
+        # Load open positions from the DB, instead of orders
+        open_positions = pd.read_sql('SELECT * FROM open_position', db.engine)
+
         today = datetime.today().date()
         var_calculations = []
 
-        for _, order in orders.iterrows():
-            currency = order['currency']
-            amount = abs(order['amount'])
-            order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = ( today - order_date ).days  # Calculate days from order's value date to today
-            
-            # Directly use `calculate_var` to get VaR values for each level
+        for _, pos in open_positions.iterrows():
+            currency = pos['currency']
+            amount = abs(pos['amount'])
+            # Suppose we treat pos['value_date'] the same as we treat orders
+            open_pos_date = pd.to_datetime(pos['value_date']).date()
+
+            # Days difference: how you define it is up to your logic
+            # e.g., (today - open_pos_date) or (open_pos_date - today)
+            days_diff = (today - open_pos_date).days
+
             var_values = calculate_var(currency, days_diff, amount)
 
             var_calculations.append({
-                "Value Date": order_date.isoformat(),
+                "Value Date": open_pos_date.isoformat(),
                 "Days": days_diff,
                 "VaR 1%": var_values['1%'],
                 "VaR 5%": var_values['5%'],
@@ -779,13 +844,12 @@ def calculate_var_api():
     except Exception as e:
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
-
 @user_bp.route('/api/calculate-forward-rate', methods=['GET'])
 def calculate_forward_rate_api():
     try:
-        # Load exchange data and orders
+        # Load exchange data
         df = pd.read_sql('SELECT * FROM exchange_data', db.engine)
-        orders = pd.read_sql('SELECT * FROM "order"', db.engine)
+        open_positions = pd.read_sql('SELECT * FROM open_position', db.engine)
 
         today = datetime.today().date()
         today_data = df[df['Date'] == today]
@@ -794,13 +858,13 @@ def calculate_forward_rate_api():
         if today_data.empty:
             return jsonify({"error": "No exchange data found for today's date"}), 404
 
-        for _, order in orders.iterrows():
-            currency = order['currency']
-            order_date = pd.to_datetime(order['value_date']).date()
-            days_diff = ( order_date -today ).days  # Calculate days from order's value date to today
+        for _, pos in open_positions.iterrows():
+            currency = pos['currency']
+            open_pos_date = pd.to_datetime(pos['value_date']).date()
+            days_diff = (open_pos_date - today).days  # or your chosen logic
 
             try:
-                # Retrieve today's spot rate and yield values for the currency and TND
+                # Retrieve today's spot rate & yields
                 spot_rate = today_data[f'Spot {currency.upper()}'].values[0]
                 yield_foreign = today_data[f'{get_yield_period(days_diff).upper()} {currency.upper()}'].values[0]
                 yield_domestic = today_data[f'{get_yield_period(days_diff).upper()} TND'].values[0]
@@ -808,19 +872,21 @@ def calculate_forward_rate_api():
                 print(f"Missing required field in exchange data: {str(e)}")
                 continue
 
-            # Calculate the forward rate
-            forward_rate = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
+            forward_rate_value = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
+
+            # Include the open_position ID so frontend can convert it
             forward_rates.append({
-                "Value Date": order_date.isoformat(),
+                "open_position_id": int(pos["id"]),  # The ID from open_position
+                "Value Date": open_pos_date.isoformat(),
                 "Days": days_diff,
-                "Forward Rate": forward_rate
+                "Forward Rate": forward_rate_value
             })
 
         return jsonify(forward_rates), 200
 
     except Exception as e:
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
-    
+   
 @user_bp.route('/api/dashboard/summary', methods=['GET'])
 @jwt_required()
 def dashboard_summary():
@@ -915,7 +981,7 @@ def dashboard_summary():
     monthly_data = defaultdict(lambda: {"monthlyTotalTransacted": 0, "monthlyTotalGain": 0})
     for order in orders:
         month_name = calendar.month_name[order.value_date.month]
-        monthly_data[month_name]["monthlyTotalTransacted"] += order.original_amount
+        monthly_data[month_name]["monthlyTotalTransacted"] += order.original_amount * order.execution_rate  # Convert to TND
 
         # Here again, fix the Gains formula inline
         if order.execution_rate is not None:
@@ -925,7 +991,7 @@ def dashboard_summary():
                 else
                 (order.execution_rate / calculate_benchmark(order)) - 1
             )
-            monthly_data[month_name]["monthlyTotalGain"] += (gain_percent * order.original_amount)
+            monthly_data[month_name]["monthlyTotalGain"] += (gain_percent * order.original_amount * order.execution_rate)
 
     # Prepare chart data
     months = list(monthly_data.keys())
@@ -965,7 +1031,13 @@ def forward_rate_table():
     currency = request.args.get("currency", "USD").upper()
 
     # Load orders filtered by currency
-    orders = Order.query.filter_by(user_id=user_id, currency=currency).all()
+    #orders = Order.query.filter_by(user_id=user_id, currency=currency).all()
+    orders = Order.query.filter(
+    Order.user_id == user_id,
+    Order.currency == currency,
+    Order.status.in_(['Executed', 'Matched'])  # Add status filter
+).all()
+
 
     # Prepare forward rate data
     forward_rate_data = []
@@ -1050,7 +1122,11 @@ def bank_gains():
     currency = request.args.get("currency", "USD").upper()
 
     # Filter orders by currency
-    orders = Order.query.filter_by(user_id=user_id, currency=currency).all()
+    orders = Order.query.filter(
+        Order.user_id == user_id,
+        Order.currency == currency,
+        Order.status.in_(['Executed', 'Matched'])  # Add status filter
+    ).all()
 
     # Group data by bank and month
     bank_data = {}
@@ -1177,16 +1253,22 @@ def update_interbank_rates():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def update_order_interbank_rates(app):
+    with app.app_context():
+        try:
+            orders = Order.query.all()
+            for order in orders:
+                if order.interbank_rate is None:  # Only fetch rates for orders missing this value
+                    rate = fetch_rate_for_date_and_currency(order.transaction_date, order.currency)
+                    if rate:
+                        print(f"Updating Order ID {order.id} with rate {rate}")
+                        order.interbank_rate = rate
+                        db.session.add(order)
+            db.session.commit()
+        except Exception as e:
+            print(f"Error updating interbank rates: {e}")
 
-def update_order_interbank_rates():
-    # Fetch orders and their respective transaction dates and currencies
-    orders = Order.query.all()
-    for order in orders:
-        rate = fetch_rate_for_date_and_currency(order.transaction_date, order.currency)
-        if rate:
-            order.interbank_rate = rate
-            db.session.add(order)
-        db.session.commit()
+
 
 def fetch_rate_for_date_and_currency(date, currency):
     formatted_date = date.strftime('%Y-%m-%d')
@@ -1201,6 +1283,32 @@ def fetch_rate_for_date_and_currency(date, currency):
             rate = float(cells[3].get_text(strip=True).replace(',', '.'))
             break
     return rate
+
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
+def start_scheduler(scheduler, app):
+    """
+    Start background jobs for general user-related functionality.
+    """
+    
+    #job for updating interbank rates daily:
+    scheduler.add_job(
+        func=update_order_interbank_rates,
+        trigger='interval',
+        hours=24,
+        kwargs={'app': app},
+        id="update_order_interbank_rates_job"
+    )
+
+    #Schedule daily job to delete expired positions
+    scheduler.add_job(
+        func=delete_expired_positions,
+        trigger='interval',
+        hours=24,  # or any frequency you need
+        kwargs={'app': app},  # pass the Flask app
+        id="delete_expired_positions_job"
+    )
 
 
 
