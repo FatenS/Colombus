@@ -14,15 +14,29 @@ import eikon as ek
 app = Flask(__name__)
 
 # Initialize Eikon API
+import os
+import eikon as ek
+
+# Initialize Eikon API
 def init_eikon():
     try:
-        ek.set_app_key(os.getenv("EIKON_APP_KEY"))  # Set App Key
-        ek.set_port_number(9000)  # Ensure the port is set manually if needed
-        print("Connected to Eikon Data API successfully.")
+        # Get the App Key from environment variable or fallback to a hardcoded value
+        app_key = os.getenv("EIKON_APP_KEY", "20af0572a6364fe8abf9a35cdd16bd367057564a")  
+        ek.set_app_key(app_key)  # Set the App Key
+        ek.set_port_number(9000)  # Proxy port for Eikon Desktop
+
+        # Debugging info
+        print(f"Using Eikon App Key: {app_key}")
+        print(f"Proxy Port: {ek.get_port_number()}")
+
+        headlines= ek.get_news_headlines('R:LHAG.DE', date_from='2024-03-15T09:00:00', date_to='2024-03-15T18:00:00')  
+        print(headlines)
     except ek.EikonError as e:
-        print("Eikon initialization error:", e)
+        print(f"Eikon initialization error: {e}")
+
 # Call Eikon initialization during app startup
 init_eikon()
+
 
 # Enable CORS for all routes
 CORS(app)
@@ -57,6 +71,7 @@ start_scheduler(scheduler, app)
 # Start scheduler once
 scheduler.start()
 socketio = init_socketio(app)
+
 
 if __name__ == "__main__":
     with app.app_context():

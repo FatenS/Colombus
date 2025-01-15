@@ -1054,4 +1054,13 @@ def start_scheduler(scheduler, app):
     )
 
 
+import eikon as ek
+@user_bp.route("/test_eikon")
+def test_eikon():
+    try:
+        headlines = ek.get_news_headlines("TOP", count=5)
+        return {"status": "success", "data": headlines.to_json()}, 200
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
 

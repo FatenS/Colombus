@@ -8,6 +8,19 @@ services:
     environment:
       POSTGRES_PASSWORD: pass123
 
+  # Socat sidecar to forward container's :9000 to the host's :9000
+  socat:
+    image: alpine/socat
+    command: >
+      tcp-listen:9000,fork,reuseaddr
+      tcp:host.docker.internal:9000
+    # For Linux hosts, replace host.docker.internal with your actual IP or 172.17.0.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9000:9000"
+    restart: always
+
   app:
     build: .
     restart: always
@@ -18,3 +31,4 @@ services:
       EIKON_APP_KEY: "20af0572a6364fe8abf9a35cdd16bd367057564a"
     depends_on:
       - db
+      - socat
