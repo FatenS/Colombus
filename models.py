@@ -85,6 +85,9 @@ class Order(db.Model):
     matched_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=True)  
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     matched_amount = db.Column(db.Float, nullable=True, default=0.0)  
+    premium = db.Column(db.Float, nullable=True)  # If not NULL => it's an Option
+    is_option = db.Column(db.Boolean, default=False)
+
     # Relationships
     user = db.relationship('User', backref='orders', lazy=True)
     matched_order = db.relationship('Order', remote_side=[id], backref='related_orders')
@@ -122,6 +125,14 @@ class ExchangeData(db.Model):
     usd_6m = db.Column(db.Float, nullable=False, name='6M USD')
 
 
+class PremiumRate(db.Model):
+    __tablename__ = 'premium_rate'
+    id = db.Column(db.Integer, primary_key=True)
+    currency = db.Column(db.String(3), nullable=False)    # e.g., 'USD', 'EUR'
+    maturity_days = db.Column(db.Integer, nullable=False) # e.g., 30, 60, 90
+    premium_percentage = db.Column(db.Float, nullable=False)
+
+
 class AuditLog(db.Model):
     __tablename__ = 'audit_log'
     id = db.Column(db.Integer, primary_key=True)
@@ -133,27 +144,3 @@ class AuditLog(db.Model):
     details = db.Column(db.Text)  # JSON string 
 
     user = db.relationship('User', backref='audit_logs')
-
-
-class YieldsData(db.Model):
-    __tablename__ = 'yields_data'
-    id = db.Column(db.Integer, primary_key=True)
-    date = db.Column(db.Date, nullable=False, index=True, unique=True)
-
-    # TND yields (we will treat TND1M, TND6M, TND9M as the same if TNDOND is identical)
-    tnd_1m = db.Column(db.Float, nullable=True)
-    tnd_6m = db.Column(db.Float, nullable=True)
-    tnd_9m = db.Column(db.Float, nullable=True)
-
-    # EUR yields
-    eur_1m = db.Column(db.Float, nullable=True)
-    eur_6m = db.Column(db.Float, nullable=True)
-    eur_9m = db.Column(db.Float, nullable=True)
-
-    # USD yields
-    usd_1m = db.Column(db.Float, nullable=True)
-    usd_6m = db.Column(db.Float, nullable=True)
-    usd_9m = db.Column(db.Float, nullable=True)
-
-    def __repr__(self):
-        return f"<YieldsData {self.date} TND1M={self.tnd_1m} ...>"

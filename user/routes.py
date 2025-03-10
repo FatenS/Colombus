@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, date
-from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition
+from scipy.interpolate import interp1d, CubicSpline
+from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition, PremiumRate
 from matplotlib import pyplot as plt
 import numpy as np
 from flask import  request, session, jsonify, Blueprint, flash, send_from_directory
@@ -150,121 +151,298 @@ def delete_expired_positions(app):
             db.session.delete(pos)
         db.session.commit()
 # ============ Order Routes ==================
+# @user_bp.route('/orders', methods=['POST'])
+# @jwt_required()
+# def submit_order_or_option():
+#     """
+#     Handles both normal orders AND options in a single endpoint.
+#     - If is_option == True => automatically calculates premium from PremiumRate
+#     - If is_option == False => normal order (premium=None)
+#     Logs debug information and writes an AuditLog.
+#     """
+
+#     debug_logs = []
+#     user_id = get_jwt_identity()
+#     debug_logs.append(f"Fetched user ID from JWT: {user_id}")
+
+#     user = User.query.get(user_id)
+#     if not user:
+#         debug_logs.append("User not found in the database")
+#         return jsonify({"message": "Invalid user", "debug": debug_logs}), 400
+#     debug_logs.append(f"User found: {user.email}")
+
+#     # Parse JSON body
+#     data = request.get_json()
+#     if not data:
+#         debug_logs.append("Request payload is empty")
+#         return jsonify({"message": "No data provided", "debug": debug_logs}), 400
+
+#     debug_logs.append(f"Raw incoming data: {data}")
+
+#     # Gather relevant fields
+#     transaction_type = data.get('transaction_type')    # "buy" / "sell"
+#     amount = data.get('amount', 0)                     # notional
+#     currency = data.get('currency')                    # "USD", "EUR", ...
+#     value_date_str = data.get('value_date')            # e.g., "2025-05-15"
+#     bank_account = data.get('bank_account')            # optional
+#     is_option = data.get('is_option', False)           # boolean
+
+#     # Basic validations
+#     if not transaction_type or not currency or not value_date_str:
+#         debug_logs.append("Missing required fields (transaction_type, currency, value_date).")
+#         return jsonify({"message": "Missing required fields", "debug": debug_logs}), 400
+
+#     # Convert fields
+#     try:
+#         amount = float(amount)
+#         value_date = datetime.strptime(value_date_str, "%Y-%m-%d")
+#         debug_logs.append(
+#             f"Parsed data: transaction_type={transaction_type}, amount={amount}, "
+#             f"currency={currency}, value_date={value_date}, bank_account={bank_account}, "
+#             f"is_option={is_option}"
+#         )
+#     except Exception as e:
+#         debug_logs.append(f"Error parsing data: {str(e)}")
+#         return jsonify({"message": "Invalid data format", "debug": debug_logs}), 400
+
+#     # Decide status: if Option => "Market" (skip matching). Else => "Pending" (normal order).
+#     if is_option:
+#         status = "Market"
+#     else:
+#         status = "Pending"
+
+#     # ---------------------------------------------------------------------------
+#     #  AUTOMATIC PREMIUM CALCULATION IF is_option == True
+#     # ---------------------------------------------------------------------------
+#     computed_premium = None
+#     if is_option:
+#         # 1) Figure out days between 'today' and 'value_date'
+#         today = datetime.now().date()
+#         days_diff = (value_date.date() - today).days  # e.g., 90, 120, etc.
+
+#         # 2) Query your PremiumRate table for the same currency
+#         all_rates = PremiumRate.query.filter_by(currency=currency.upper()).all()
+#         if not all_rates:
+#             debug_logs.append(f"No premium rates found for currency={currency}.")
+#             return jsonify({"message": f"No premium rates found for {currency}", "debug": debug_logs}), 400
+
+#         # 3) Find the row with the closest 'maturity_days' to 'days_diff'
+#         chosen_rate = None
+#         min_delta = float("inf")
+#         for r in all_rates:
+#             delta = abs(r.maturity_days - days_diff)
+#             if delta < min_delta:
+#                 min_delta = delta
+#                 chosen_rate = r
+
+#         if not chosen_rate:
+#             debug_logs.append("Unable to find suitable premium rate.")
+#             return jsonify({"message": "Unable to find suitable premium rate", "debug": debug_logs}), 400
+
+#         # 4) Calculate premium = notional * premium_percentage
+#         computed_premium = amount * chosen_rate.premium_percentage
+#         debug_logs.append(
+#             f"Calculated premium: notional={amount}, days_diff={days_diff}, "
+#             f"picked maturity={chosen_rate.maturity_days}, "
+#             f"premium_percentage={chosen_rate.premium_percentage}, "
+#             f"final_premium={computed_premium}"
+#         )
+
+#     # Generate a unique ID for the order (if desired)
+#     unique_id = str(uuid.uuid4())
+#     debug_logs.append(f"Generated unique order ID: {unique_id}")
+
+#     # Create the Order object
+#     try:
+#         new_order = Order(
+#             id_unique=unique_id,
+#             user=user,
+#             transaction_type=transaction_type,
+#             amount=amount,
+#             original_amount=amount,
+#             currency=currency,
+#             value_date=value_date,
+#             transaction_date=datetime.now(),
+#             order_date=datetime.now(),
+#             bank_account=bank_account,
+#             reference=data.get('reference', f'REF-{unique_id}'),
+#             status=status,
+#             rating=user.rating,
+#             premium=computed_premium,  # The computed premium or None
+#             is_option=is_option
+#         )
+#         debug_logs.append(f"Order/Option object created: {new_order}")
+#     except Exception as e:
+#         debug_logs.append(f"Error creating Order object: {str(e)}")
+#         return jsonify({"message": "Error creating Order object", "debug": debug_logs}), 500
+
+#     # Save in DB
+#     try:
+#         db.session.add(new_order)
+#         db.session.commit()
+#         debug_logs.append("Order/Option saved to the database")
+#     except Exception as e:
+#         db.session.rollback()
+#         debug_logs.append(f"Database error: {str(e)}")
+#         return jsonify({"message": "Database error", "debug": debug_logs}), 500
+
+#     # Log the action in AuditLog
+#     try:
+#         log = AuditLog(
+#             action_type='create',
+#             table_name='order',
+#             record_id=new_order.id_unique,
+#             user_id=user_id,
+#             details=json.dumps({
+#                 "id": new_order.id_unique,
+#                 "transaction_type": transaction_type,
+#                 "amount": amount,
+#                 "currency": currency,
+#                 "value_date": value_date_str,
+#                 "bank_account": bank_account,
+#                 "is_option": is_option,
+#                 "premium": computed_premium
+#             })
+#         )
+#         db.session.add(log)
+#         db.session.commit()
+#         debug_logs.append("Audit log saved to the database")
+#     except Exception as e:
+#         db.session.rollback()
+#         debug_logs.append(f"Error saving audit log: {str(e)}")
+#         return jsonify({"message": "Error saving audit log", "debug": debug_logs}), 500
+
+#     # Return success
+#     return jsonify({
+#         "message": "Order/Option submitted successfully",
+#         "order_id": new_order.id_unique,
+#         "premium": computed_premium,
+#         "debug": debug_logs
+#     }), 201
 @user_bp.route('/orders', methods=['POST'])
 @jwt_required()
-def submit_order():
-    """
-    API for a client to submit an order.
-    Logs the creation action in the AuditLog and returns debug logs in the response.
-    """
-    debug_logs = []  # List to store log messages
+def submit_order_or_option():
+    debug_logs = []
+    user_id = get_jwt_identity()
+    debug_logs.append(f"Fetched user ID from JWT: {user_id}")
+
+    user = User.query.get(user_id)
+    if not user:
+        debug_logs.append("User not found in the database")
+        return jsonify({"message": "Invalid user", "debug": debug_logs}), 400
+    debug_logs.append(f"User found: {user.email}")
+
+    data = request.get_json()
+    if not data:
+        debug_logs.append("Request payload is empty")
+        return jsonify({"message": "No data provided", "debug": debug_logs}), 400
+
+    debug_logs.append(f"Raw incoming data: {data}")
+
+    # Gather necessary fields
+    transaction_type = data.get('transaction_type')
+    try:
+        amount = float(data.get('amount', 0))
+    except Exception as e:
+        return jsonify({"message": "Amount must be numeric", "debug": debug_logs}), 400
+    currency = data.get('currency')
+    value_date_str = data.get('value_date')  # expected format: "YYYY-MM-DD"
+    bank_account = data.get('bank_account')
+    is_option = data.get('is_option', False)
+
+    if not transaction_type or not currency or not value_date_str:
+        debug_logs.append("Missing required fields (transaction_type, currency, value_date).")
+        return jsonify({"message": "Missing required fields", "debug": debug_logs}), 400
 
     try:
-        # Fetch the user ID from the JWT token
-        user_id = get_jwt_identity()
-        debug_logs.append(f"Fetched user ID from JWT: {user_id}")
-
-        user = User.query.get(user_id)
-        if not user:
-            debug_logs.append("User not found in the database")
-            return jsonify({"message": "Invalid user", "debug": debug_logs}), 400
-
-        debug_logs.append(f"User found: {user.email}")
-
-        # Parse and validate incoming data
-        data = request.get_json()
-        if not data:
-            debug_logs.append("Request payload is empty")
-            return jsonify({"message": "No data provided", "debug": debug_logs}), 400
-
-        debug_logs.append(f"Raw incoming data: {data}")
-
-        # Validate required fields
-        required_fields = ["transaction_type", "amount", "currency", "value_date", "bank_account"]
-        missing_fields = [field for field in required_fields if field not in data]
-        if missing_fields:
-            debug_logs.append(f"Missing fields: {missing_fields}")
-            return jsonify({"message": "Missing required fields", "debug": debug_logs}), 400
-
-        # Validate data types
-        try:
-            transaction_type = data['transaction_type']
-            amount = float(data['amount'])
-            currency = data['currency']
-            value_date = datetime.strptime(data['value_date'], "%Y-%m-%d")
-            bank_account = data['bank_account']
-            debug_logs.append(f"Parsed data: transaction_type={transaction_type}, amount={amount}, "
-                              f"currency={currency}, value_date={value_date}, bank_account={bank_account}")
-        except Exception as e:
-            debug_logs.append(f"Error parsing data: {str(e)}")
-            return jsonify({"message": "Invalid data format", "debug": debug_logs}), 400
-
-        # Generate a unique ID for the order
-        unique_id = str(uuid.uuid4())
-        debug_logs.append(f"Generated unique order ID: {unique_id}")
-
-        # Create the new order
-        try:
-            new_order = Order(
-                id_unique=unique_id,
-                user=user,
-                transaction_type=transaction_type,
-                amount=amount,
-                original_amount=amount,
-                currency=currency,
-                value_date=value_date,
-                transaction_date=datetime.now(),
-                order_date=datetime.now(),
-                bank_account=bank_account,
-                reference=data.get('reference', 'REF' + unique_id),
-                status="Pending",
-                rating=user.rating,
-            )
-            debug_logs.append(f"Order object created: {new_order}")
-        except Exception as e:
-            debug_logs.append(f"Error creating Order object: {str(e)}")
-            return jsonify({"message": "Error creating Order object", "debug": debug_logs}), 500
-
-        # Save the new order to the database
-        try:
-            db.session.add(new_order)
-            db.session.commit()
-            debug_logs.append("Order saved to the database")
-        except Exception as e:
-            db.session.rollback()
-            debug_logs.append(f"Database error: {str(e)}")
-            return jsonify({"message": "Database error", "debug": debug_logs}), 500
-
-        # Log the action
-        try:
-            log = AuditLog(
-                action_type='create',
-                table_name='order',
-                record_id=new_order.id_unique,
-                user_id=user_id,
-                details=json.dumps({
-                    "id": new_order.id_unique,
-                    "transaction_type": transaction_type,
-                    "amount": amount,
-                    "currency": currency,
-                    "value_date": value_date.strftime("%Y-%m-%d"),
-                    "bank_account": bank_account,
-                })
-            )
-            db.session.add(log)
-            db.session.commit()
-            debug_logs.append("Audit log saved to the database")
-        except Exception as e:
-            db.session.rollback()
-            debug_logs.append(f"Error saving audit log: {str(e)}")
-            return jsonify({"message": "Error saving audit log", "debug": debug_logs}), 500
-
-        return jsonify({"message": "Order executed successfully", "order_id": new_order.id_unique, "debug": debug_logs}), 201
-
+        value_date = datetime.strptime(value_date_str, "%Y-%m-%d")
+        debug_logs.append(
+            f"Parsed data: transaction_type={transaction_type}, amount={amount}, "
+            f"currency={currency}, value_date={value_date}, bank_account={bank_account}, "
+            f"is_option={is_option}"
+        )
     except Exception as e:
-        # Catch any unexpected error and return its details
-        debug_logs.append(f"Unexpected error: {str(e)}")
-        return jsonify({"message": "An unexpected error occurred", "debug": debug_logs}), 500
+        debug_logs.append(f"Error parsing dates: {str(e)}")
+        return jsonify({"message": "Invalid date format", "debug": debug_logs}), 400
+
+    # Set order status based on whether it is an option
+    status = "Market" if is_option else "Pending"
+
+    computed_premium = None
+    if is_option:
+        # Use today's date as the trade date (or replace with a specific transaction date if needed)
+        trade_date_str = datetime.now().strftime('%d/%m/%Y')
+        echeance_str = value_date.strftime('%d/%m/%Y')
+        ttm = calculate_time_to_maturity(trade_date_str, echeance_str)
+        debug_logs.append(f"Calculated time to maturity: {ttm:.4f} years")
+
+        # Query the PremiumRate model for the given currency
+        premium_rates = PremiumRate.query.filter_by(currency=currency.upper()).all()
+        if not premium_rates:
+            debug_logs.append(f"No premium rates found for currency: {currency.upper()}")
+            return jsonify({"message": f"No premium rates found for {currency}", "debug": debug_logs}), 400
+
+        # Convert maturity_days from days to years and extract premium percentages
+        known_times = np.array([r.maturity_days / 365.0 for r in premium_rates])
+        known_primes = np.array([r.premium_percentage for r in premium_rates])
+        debug_logs.append(f"Known times (years): {known_times}")
+        debug_logs.append(f"Known premiums: {known_primes}")
+
+        # Get interpolated premium percentages using our helper function
+        interpolated = interpolate_prime(ttm, known_times, known_primes)
+        # Choose an interpolation method – here we use the linear method
+        chosen_rate = float(interpolated['Linear'])
+        debug_logs.append(f"Interpolated premium percentage (Linear): {chosen_rate:.4f}")
+
+        # Calculate the premium using the interpolated premium percentage
+        computed_premium = amount * chosen_rate
+        debug_logs.append(f"Computed premium: {computed_premium:.4f}")
+
+    # Generate a unique order ID
+    unique_id = str(uuid.uuid4())
+    debug_logs.append(f"Generated unique order ID: {unique_id}")
+
+    try:
+        new_order = Order(
+            id_unique=unique_id,
+            user=user,
+            transaction_type=transaction_type,
+            amount=amount,
+            original_amount=amount,
+            currency=currency,
+            value_date=value_date,
+            transaction_date=datetime.now(),
+            order_date=datetime.now(),
+            bank_account=bank_account,
+            reference=data.get('reference', f'REF-{unique_id}'),
+            status=status,
+            rating=user.rating,
+            premium=computed_premium,  # Computed via interpolation for options
+            is_option=is_option
+        )
+        debug_logs.append(f"Order/Option object created: {new_order}")
+    except Exception as e:
+        debug_logs.append(f"Error creating Order object: {str(e)}")
+        return jsonify({"message": "Error creating Order object", "debug": debug_logs}), 500
+
+    try:
+        db.session.add(new_order)
+        db.session.commit()
+        debug_logs.append("Order/Option saved to the database")
+    except Exception as e:
+        db.session.rollback()
+        debug_logs.append(f"Database error: {str(e)}")
+        return jsonify({"message": "Database error", "debug": debug_logs}), 500
+
+    # (Optionally, add audit logging here.)
+    
+    return jsonify({
+        "message": "Order/Option submitted successfully",
+        "order_id": new_order.id_unique,
+        "premium": computed_premium,
+        "debug": debug_logs
+    }), 201
+
 
 
 @user_bp.route('/orders', methods=['GET'])
@@ -288,7 +466,9 @@ def view_orders():
             "currency": order.currency,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
             "status": order.status,
-            "client_name": order.user.client_name
+            "client_name": order.user.client_name,
+            "premium": order.premium,       
+            "is_option": order.is_option, 
         })
     
     return jsonify(order_list), 200
@@ -988,11 +1168,12 @@ def calculate_benchmark(order):
     return base_benchmark
 
 
+from flask import current_app
 
 @user_bp.route('/update-interbank-rates', methods=['POST'])
 def update_interbank_rates():
     try:
-        update_order_interbank_rates()  
+        update_order_interbank_rates(current_app)  # pass in current_app
         return jsonify({'message': 'Interbank rates updated successfully'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1030,37 +1211,48 @@ def fetch_rate_for_date_and_currency(date, currency):
 
 
 
-def start_scheduler(scheduler, app):
+# import eikon as ek
+# @user_bp.route("/test_eikon")
+# def test_eikon():
+#     try:
+#         headlines = ek.get_news_headlines("TOP", count=5)
+#         return {"status": "success", "data": headlines.to_json()}, 200
+#     except Exception as e:
+#         return {"status": "error", "message": str(e)}, 500
+
+
+def calculate_time_to_maturity(trade_date, echeance):
     """
-    Start background jobs for general user-related functionality.
+    Calculates time to maturity (in years) given the trade date and the value (or maturity) date.
+    Both dates should be strings in the format '%d/%m/%Y'.
     """
+    trade_date = pd.to_datetime(trade_date, format='%d/%m/%Y')
+    echeance = pd.to_datetime(echeance, format='%d/%m/%Y')
+    return (echeance - trade_date).days / 365
+
+def interpolate_prime(time_to_maturity, known_times, known_primes):
+    """
+    Interpolates the premium percentage based on the target time_to_maturity.
     
-    #job for updating interbank rates daily:
-    scheduler.add_job(
-        func=update_order_interbank_rates,
-        trigger='interval',
-        hours=24,
-        kwargs={'app': app},
-        id="update_order_interbank_rates_job"
-    )
+    Parameters:
+      - time_to_maturity: The calculated time (in years) for the option.
+      - known_times: A NumPy array of times (in years) from your PremiumRate model.
+      - known_primes: A NumPy array of premium percentages corresponding to the known times.
+    
+    Returns:
+      A dictionary with values computed using different interpolation methods.
+    """
+    # Ensure known times and primes are sorted in increasing order
+    sorted_indices = np.argsort(known_times)
+    known_times = known_times[sorted_indices]
+    known_primes = known_primes[sorted_indices]
 
-    #Schedule daily job to delete expired positions
-    scheduler.add_job(
-        func=delete_expired_positions,
-        trigger='interval',
-        hours=24,  # or any frequency you need
-        kwargs={'app': app},  # pass the Flask app
-        id="delete_expired_positions_job"
-    )
-
-
-import eikon as ek
-@user_bp.route("/test_eikon")
-def test_eikon():
-    try:
-        headlines = ek.get_news_headlines("TOP", count=5)
-        return {"status": "success", "data": headlines.to_json()}, 200
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
-
+    linear_interp = interp1d(known_times, known_primes, kind='linear', fill_value='extrapolate')
+    quadratic_interp = interp1d(known_times, known_primes, kind='quadratic', fill_value='extrapolate')
+    cubic_spline = CubicSpline(known_times, known_primes, extrapolate=True)
+    
+    return {
+        'Linear': linear_interp(time_to_maturity),
+        'Quadratic': quadratic_interp(time_to_maturity),
+        'CubicSpline': cubic_spline(time_to_maturity),
+    }

@@ -1,5 +1,6 @@
 import base64
 from io import BytesIO
+import re
 import os
 import json
 import random
@@ -16,7 +17,7 @@ from .services.export_service import export_pdf, download_excel
 from models import db, Order, ExchangeData
 from flask_login import login_user, logout_user, current_user
 from functools import wraps
-from models import User, Role, AuditLog
+from models import User, Role, AuditLog, PremiumRate
 from flask_security import roles_accepted
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -115,23 +116,25 @@ def view_all_orders():
     if not orders:
         return jsonify([]), 200
     
-    # Prepare the list of orders to return
     order_list = []
     for order in orders:
         order_list.append({
             "id": order.id,
-            "user": order.user.email if order.user else "Unknown",  # Show user's email
+            "user": order.user.email if order.user else "Unknown",
             "transaction_type": order.transaction_type,
             "amount": order.amount,
             "currency": order.currency,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
             "transaction_date": order.transaction_date.strftime("%Y-%m-%d"),
             "status": order.status,
-            "client_name": order.user.client_name if order.user else "Unknown",  # Show client's name
-            "execution_rate": order.execution_rate,  # Admin can see the execution rate
-            "bank_name": order.bank_name,  # Admin can see the bank name
-            "interbank_rate": order.interbank_rate,  # Include the interbank rate
-            "historical_loss": order.historical_loss,  # Include the historical loss
+            "client_name": order.user.client_name if order.user else "Unknown",
+            "execution_rate": order.execution_rate,
+            "bank_name": order.bank_name,
+            "interbank_rate": order.interbank_rate,
+            "historical_loss": order.historical_loss,
+            # ADD THESE TWO LINES:
+            "premium": order.premium,
+            "is_option": order.is_option
         })
 
     return jsonify(order_list), 200
@@ -581,161 +584,371 @@ def upload_orders():
         return jsonify({'error': f'Failed to process file: {str(e)}'}), 500
 
 
-import eikon as ek
-from models import db, YieldsData
-from datetime import date
+@admin_bp.route('/api/premium-rate', methods=['POST'])
+@jwt_required()
+@roles_required('Admin')
+def create_premium_rate():
+    data = request.get_json()
+    currency = data.get('currency')
+    maturity_days = data.get('maturity_days')
+    premium_percentage = data.get('premium_percentage')
 
-@admin_bp.route('/api/fetch-yields', methods=['POST'])
-def fetch_yields():
-    """
-    Fetch TND, EUR, USD yields from Eikon from August 1 until today, 
-    then store them in the yields_data table.
-    Trigger it once via Postman (POST).
-    """
-    try:
-        # 1) Define date range
-        start_date = "2023-08-01"
-        end_date = date.today().strftime("%Y-%m-%d")
+    if not all([currency, maturity_days, premium_percentage]):
+        return jsonify({'error': 'Missing fields'}), 400
 
-        # 2) List of instruments (TNDOND, EUR1MD, etc.)
-        # We'll do multiple calls to get_timeseries 
-        # because each code might have separate timeseries.
-        instruments = {
-            "TNDOND": ["tnd_1m", "tnd_6m", "tnd_9m"],  # All the same
-            "EUR1MD": "eur_1m",
-            "EUR6MD": "eur_6m",
-            "EUR9MD": "eur_9m",
-            "USD1MD": "usd_1m",
-            "USD6MD": "usd_6m",
-            "USD9MD": "usd_9m",
-        }
-
-        # We'll store results in a dict keyed by date, each date is a sub-dict of yields
-        data_by_date = {}
-
-        for ric, columns in instruments.items():
-            # get daily timeseries from Eikon for that RIC
-            df = ek.get_timeseries(
-                ric, 
-                start_date=start_date, 
-                end_date=end_date, 
-                interval="daily"
-            )
-            # 'df' has a DateTime index and typically an 'CLOSE' or 'Value' column 
-            # depending on the instrument. Let's see how Eikon returns it.
-            # For TNDOND, etc., it might be "CLOSE" or "HIGH" or just 0. We'll assume "CLOSE".
-
-            if df is None or df.empty:
-                continue  # no data
-
-            for ts_index, row in df.iterrows():
-                d = ts_index.date()  # Convert to Python date (ts_index is a Timestamp)
-                # Usually the yield is in row["CLOSE"] if there's only one column
-                val = None
-                if "CLOSE" in row:
-                    val = row["CLOSE"]
-                else:
-                    # fallback if it's named differently
-                    val = row.get("Value", None)
-
-                if val is None:
-                    continue
-
-                if d not in data_by_date:
-                    data_by_date[d] = {
-                        "tnd_1m": None,
-                        "tnd_6m": None,
-                        "tnd_9m": None,
-                        "eur_1m": None,
-                        "eur_6m": None,
-                        "eur_9m": None,
-                        "usd_1m": None,
-                        "usd_6m": None,
-                        "usd_9m": None,
-                    }
-
-                if isinstance(columns, list):
-                    # This means TNDOND => fill all 3 columns with the same value
-                    for col in columns:
-                        data_by_date[d][col] = float(val)
-                else:
-                    data_by_date[d][columns] = float(val)
-
-        # 3) Insert rows into yields_data table
-        for d, yields_dict in data_by_date.items():
-            # Check if row for this date already exists (in case you re-run)
-            existing = YieldsData.query.filter_by(date=d).first()
-            if existing:
-                # Just update
-                existing.tnd_1m = yields_dict["tnd_1m"]
-                existing.tnd_6m = yields_dict["tnd_6m"]
-                existing.tnd_9m = yields_dict["tnd_9m"]
-                existing.eur_1m = yields_dict["eur_1m"]
-                existing.eur_6m = yields_dict["eur_6m"]
-                existing.eur_9m = yields_dict["eur_9m"]
-                existing.usd_1m = yields_dict["usd_1m"]
-                existing.usd_6m = yields_dict["usd_6m"]
-                existing.usd_9m = yields_dict["usd_9m"]
-            else:
-                new_row = YieldsData(
-                    date=d,
-                    tnd_1m=yields_dict["tnd_1m"],
-                    tnd_6m=yields_dict["tnd_6m"],
-                    tnd_9m=yields_dict["tnd_9m"],
-                    eur_1m=yields_dict["eur_1m"],
-                    eur_6m=yields_dict["eur_6m"],
-                    eur_9m=yields_dict["eur_9m"],
-                    usd_1m=yields_dict["usd_1m"],
-                    usd_6m=yields_dict["usd_6m"],
-                    usd_9m=yields_dict["usd_9m"],
-                )
-                db.session.add(new_row)
-
-        db.session.commit()
-        return jsonify({"message": "Yields fetched and stored successfully"}), 200
-
-    except ek.EikonError as e:
-        return jsonify({"error": str(e)}), 500
-    except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
-
-@admin_bp.route('/api/fetch-yields', methods=['GET'])
-def get_yields():
-    """
-    Retrieve yields from the yields_data table
-    for a given date range or the entire set.
-    Example usage:
-      GET /api/fetch-yields?start=2023-08-01&end=2023-09-30
-    """
-    start_str = request.args.get("start", "2023-08-01")
-    end_str   = request.args.get("end", date.today().strftime("%Y-%m-%d"))
-
-    try:
-        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-        end_date   = datetime.strptime(end_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
-
-    rows = (
-        YieldsData.query
-        .filter(YieldsData.date >= start_date, YieldsData.date <= end_date)
-        .order_by(YieldsData.date)
-        .all()
+    new_rate = PremiumRate(
+        currency=currency.upper(),
+        maturity_days=int(maturity_days),
+        premium_percentage=float(premium_percentage),
     )
+    db.session.add(new_rate)
+    db.session.commit()
 
-    output = []
-    for r in rows:
-        output.append({
-            "date": r.date.strftime("%Y-%m-%d"),
-            "tnd_1m": r.tnd_1m,
-            "tnd_6m": r.tnd_6m,
-            "tnd_9m": r.tnd_9m,
-            "eur_1m": r.eur_1m,
-            "eur_6m": r.eur_6m,
-            "eur_9m": r.eur_9m,
-            "usd_1m": r.usd_1m,
-            "usd_6m": r.usd_6m,
-            "usd_9m": r.usd_9m,
+    return jsonify({'message': 'Premium rate created'}), 201
+
+@admin_bp.route('/api/premium-rate', methods=['GET'])
+@jwt_required()
+@roles_required('Admin')
+def list_premium_rates():
+    rates = PremiumRate.query.all()
+    result = []
+    for r in rates:
+        result.append({
+            'id': r.id,
+            'currency': r.currency,
+            'maturity_days': r.maturity_days,
+            'premium_percentage': r.premium_percentage
         })
+    return jsonify(result), 200
 
-    return jsonify(output), 200
+@admin_bp.route('/api/premium-rate/<int:rate_id>', methods=['PUT'])
+@jwt_required()
+@roles_required('Admin')
+def update_premium_rate(rate_id):
+    data = request.get_json()
+    rate = PremiumRate.query.get_or_404(rate_id)
+    
+    currency = data.get('currency', rate.currency)
+    maturity_days = data.get('maturity_days', rate.maturity_days)
+    premium_percentage = data.get('premium_percentage', rate.premium_percentage)
+
+    rate.currency = currency.upper()
+    rate.maturity_days = int(maturity_days)
+    rate.premium_percentage = float(premium_percentage)
+
+    db.session.commit()
+    return jsonify({'message': 'Premium rate updated'}), 200
+
+@admin_bp.route('/api/premium-rate/<int:rate_id>', methods=['DELETE'])
+@jwt_required()
+@roles_required('Admin')
+def delete_premium_rate(rate_id):
+    rate = PremiumRate.query.get_or_404(rate_id)
+    db.session.delete(rate)
+    db.session.commit()
+    return jsonify({'message': 'Premium rate deleted'}), 200
+
+# @admin_bp.route('/api/upsert-exchange-data', methods=['POST'])
+# def upsert_exchange_data():
+#     # Folder where JSON files are stored (should match your mount point)
+#     data_dir = os.path.join(current_app.root_path, 'data')
+    
+#     try:
+#         all_files = os.listdir(data_dir)
+#     except Exception as e:
+#         return jsonify({'message': f'Error accessing data directory: {str(e)}'}), 500
+
+#     # Regex patterns for the JSON filenames
+#     mid_pattern = re.compile(r"midmarket_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+#     yield_pattern = re.compile(r"daily_yield_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+
+#     mid_files = sorted([f for f in all_files if mid_pattern.search(f)])
+#     yield_files = sorted([f for f in all_files if yield_pattern.search(f)])
+
+#     if not mid_files or not yield_files:
+#         return jsonify({'message': 'Required JSON files are missing'}), 404
+
+#     # Use the latest files (filenames sort correctly with this format)
+#     latest_mid_file = os.path.join(data_dir, mid_files[-1])
+#     latest_yield_file = os.path.join(data_dir, yield_files[-1])
+
+#     try:
+#         with open(latest_mid_file, 'r') as f:
+#             mid_data = json.load(f)
+#         with open(latest_yield_file, 'r') as f:
+#             yield_data = json.load(f)
+#     except Exception as e:
+#         return jsonify({'message': f'Error reading JSON files: {str(e)}'}), 500
+
+#     # Process each record from midmarket data
+#     for mid_record in mid_data:
+#         try:
+#             # Convert the Timestamp to a date (ignoring time)
+#             mid_date = datetime.fromisoformat(mid_record['Timestamp']).date()
+#         except Exception:
+#             continue  # Skip record if conversion fails
+
+#         spot_usd = mid_record.get('spotUSD')
+#         spot_eur = mid_record.get('spotEUR')
+
+#         # Find a matching yield record based on date (ignoring time)
+#         matching_yield = next(
+#             (
+#                 y for y in yield_data 
+#                 if datetime.fromisoformat(y.get('Timestamp')).date() == mid_date
+#             ),
+#             None
+#         )
+#         if matching_yield:
+#             tnd_1m = matching_yield.get('Mid_TND')
+#             usd_1m = matching_yield.get('Mid_USD1M')
+#             eur_1m = matching_yield.get('Mid_EUR1M')
+#             usd_3m = matching_yield.get('Mid_USD3M')
+#             usd_6m = matching_yield.get('Mid_USD6M')
+#             eur_3m = matching_yield.get('Mid_EUR3M')
+#             eur_6m = matching_yield.get('Mid_EUR6M')
+#         else:
+#             tnd_1m = usd_1m = eur_1m = usd_3m = usd_6m = eur_3m = eur_6m = None
+
+#         # Upsert: if a record for this date exists, update it; otherwise, create a new one.
+#         record = ExchangeData.query.filter_by(date=mid_date).first()
+#         if record:
+#             record.spot_usd = spot_usd
+#             record.spot_eur = spot_eur
+#             record.tnd_1m = tnd_1m if tnd_1m is not None else record.tnd_1m
+#             record.usd_1m = usd_1m if usd_1m is not None else record.usd_1m
+#             record.eur_1m = eur_1m if eur_1m is not None else record.eur_1m
+#             record.usd_3m = usd_3m if usd_3m is not None else record.usd_3m
+#             record.usd_6m = usd_6m if usd_6m is not None else record.usd_6m
+#             record.eur_3m = eur_3m if eur_3m is not None else record.eur_3m
+#             record.eur_6m = eur_6m if eur_6m is not None else record.eur_6m
+#         else:
+#             record = ExchangeData(
+#                 date=mid_date,
+#                 spot_usd=spot_usd,
+#                 spot_eur=spot_eur,
+#                 tnd_1m=tnd_1m or 0.0,
+#                 usd_1m=usd_1m or 0.0,
+#                 eur_1m=eur_1m or 0.0,
+#                 usd_3m=usd_3m or 0.0,
+#                 usd_6m=usd_6m or 0.0,
+#                 eur_3m=eur_3m or 0.0,
+#                 eur_6m=eur_6m or 0.0,
+#                 # For TND 3M and 6M, if no values are provided in yield data,
+#                 # you can choose to default them to the 1M value or zero.
+#                 tnd_3m=tnd_1m or 0.0,
+#                 tnd_6m=tnd_1m or 0.0,
+#             )
+#             db.session.add(record)
+
+#     try:
+#         db.session.commit()
+#         return jsonify({'message': 'Exchange data upserted successfully'}), 200
+#     except Exception as e:
+#         db.session.rollback()
+#         return jsonify({'message': f'Error updating database: {str(e)}'}), 500
+
+# # (Other admin endpoints, e.g., export-pdf, can be added here as needed.)
+# @admin_bp.route('/api/debug-exchange', methods=['GET'])
+# def debug_exchange():
+#     """
+#     Simple debug endpoint to list all records from the exchange_data table.
+#     """
+#     data = ExchangeData.query.all()
+#     rows = []
+#     for row in data:
+#         rows.append({
+#             'id': row.id,
+#             'date': row.date.isoformat(),
+#             'spot_usd': row.spot_usd,
+#             'spot_eur': row.spot_eur,
+#             'tnd_1m': row.tnd_1m,
+#             'usd_1m': row.usd_1m,
+#             'eur_1m': row.eur_1m,
+#             'tnd_3m': row.tnd_3m,
+#             'usd_3m': row.usd_3m,
+#             'eur_3m': row.eur_3m,
+#             'tnd_6m': row.tnd_6m,
+#             'usd_6m': row.usd_6m,
+#             'eur_6m': row.eur_6m,
+#         })
+#     return jsonify(rows), 200
+
+
+
+@admin_bp.route('/api/upsert-exchange-data', methods=['POST'])
+def upsert_exchange_data():
+    """
+    Reads the latest JSON files (midmarket & yield) from /data folder,
+    and upserts into the exchange_data table.
+    Returns debug logs in the API response.
+    """
+    debug_messages = []  # Store debug logs
+
+    data_dir = os.path.join(current_app.root_path, 'data')
+    debug_messages.append(f"Data directory: {data_dir}")
+
+    try:
+        all_files = os.listdir(data_dir)
+        debug_messages.append(f"Files in directory: {all_files}")
+    except Exception as e:
+        return jsonify({
+            'message': f'Error accessing data directory: {str(e)}',
+            'debug': debug_messages
+        }), 500
+
+    # Regex patterns
+    mid_pattern = re.compile(r"midmarket_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+    yield_pattern = re.compile(r"daily_yield_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+
+    mid_files = sorted([f for f in all_files if mid_pattern.search(f)])
+    yield_files = sorted([f for f in all_files if yield_pattern.search(f)])
+    debug_messages.append(f"Found mid_files: {mid_files}")
+    debug_messages.append(f"Found yield_files: {yield_files}")
+
+    if not mid_files or not yield_files:
+        return jsonify({
+            'message': 'Required JSON files are missing',
+            'debug': debug_messages
+        }), 404
+
+    latest_mid_file = os.path.join(data_dir, mid_files[-1])
+    latest_yield_file = os.path.join(data_dir, yield_files[-1])
+    debug_messages.append(f"Latest mid file: {latest_mid_file}")
+    debug_messages.append(f"Latest yield file: {latest_yield_file}")
+
+    try:
+        with open(latest_mid_file, 'r') as f:
+            mid_data = json.load(f)
+        with open(latest_yield_file, 'r') as f:
+            yield_data = json.load(f)
+        debug_messages.append(f"Loaded {len(mid_data)} mid-data records")
+        debug_messages.append(f"Loaded {len(yield_data)} yield-data records")
+    except Exception as e:
+        return jsonify({
+            'message': f'Error reading JSON files: {str(e)}',
+            'debug': debug_messages
+        }), 500
+
+    records_processed = 0
+    for mid_record in mid_data:
+        ts_str = mid_record.get('Timestamp')
+        if not ts_str:
+            debug_messages.append("Skipping record: 'Timestamp' key missing or empty.")
+            continue
+
+        try:
+            # IMPORTANT CHANGE: Remove "datetime.datetime."
+            mid_date = datetime.fromisoformat(ts_str).date()
+            debug_messages.append(f"Parsed date: {ts_str} => {mid_date}")
+        except Exception as e:
+            debug_messages.append(f"Skipping record - parse error [{ts_str}]: {str(e)}")
+            continue
+
+        spot_usd = mid_record.get('spotUSD')
+        spot_eur = mid_record.get('spotEUR')
+
+        # Find matching yield by date
+        match = None
+        for y in yield_data:
+            y_ts_str = y.get('Timestamp')
+            if not y_ts_str:
+                continue
+            try:
+                yd_date = datetime.fromisoformat(y_ts_str).date()
+                if yd_date == mid_date:
+                    match = y
+                    break
+            except Exception as e:
+                # Just skip yields that fail parse
+                continue
+
+        if match:
+            tnd_1m = match.get('Mid_TND')
+            usd_1m = match.get('Mid_USD1M')
+            eur_1m = match.get('Mid_EUR1M')
+            usd_3m = match.get('Mid_USD3M')
+            usd_6m = match.get('Mid_USD6M')
+            eur_3m = match.get('Mid_EUR3M')
+            eur_6m = match.get('Mid_EUR6M')
+            debug_messages.append(f"Found matching yield for {mid_date}")
+        else:
+            tnd_1m = usd_1m = eur_1m = usd_3m = usd_6m = eur_3m = eur_6m = None
+            debug_messages.append(f"No yield match found for {mid_date}")
+
+        # Upsert into ExchangeData
+        record = ExchangeData.query.filter_by(date=mid_date).first()
+        if record:
+            # Update existing
+            record.spot_usd = spot_usd
+            record.spot_eur = spot_eur
+            if tnd_1m is not None: record.tnd_1m = tnd_1m
+            if usd_1m is not None: record.usd_1m = usd_1m
+            if eur_1m is not None: record.eur_1m = eur_1m
+            if usd_3m is not None: record.usd_3m = usd_3m
+            if usd_6m is not None: record.usd_6m = usd_6m
+            if eur_3m is not None: record.eur_3m = eur_3m
+            if eur_6m is not None: record.eur_6m = eur_6m
+            debug_messages.append(f"Updated existing record for {mid_date}")
+        else:
+            # Create new
+            new_record = ExchangeData(
+                date=mid_date,
+                spot_usd=spot_usd,
+                spot_eur=spot_eur,
+                tnd_1m=tnd_1m or 0.0,
+                usd_1m=usd_1m or 0.0,
+                eur_1m=eur_1m or 0.0,
+                usd_3m=usd_3m or 0.0,
+                usd_6m=usd_6m or 0.0,
+                eur_3m=eur_3m or 0.0,
+                eur_6m=eur_6m or 0.0,
+                tnd_3m=tnd_1m or 0.0,
+                tnd_6m=tnd_1m or 0.0,
+            )
+            db.session.add(new_record)
+            debug_messages.append(f"Created new record for {mid_date}")
+
+        records_processed += 1
+
+    try:
+        db.session.commit()
+        debug_messages.append(f"{records_processed} mid-data records processed (some might be skipped if parse failed).")
+        return jsonify({
+            'message': 'Exchange data upserted successfully',
+            'debug': debug_messages
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        debug_messages.append(f"Error committing changes: {str(e)}")
+        return jsonify({
+            'message': f'Error updating database: {str(e)}',
+            'debug': debug_messages
+        }), 500
+
+
+@admin_bp.route('/api/debug-exchange', methods=['GET'])
+def debug_exchange():
+    """
+    Simple debug endpoint to list all records from the exchange_data table
+    (via SQLAlchemy ORM). Note how we use model attributes, not raw DB column names.
+    """
+    data = ExchangeData.query.all()
+    rows = []
+    for row in data:
+        rows.append({
+            'id': row.id,
+            'date': row.date.isoformat(),
+            'spot_usd': row.spot_usd,
+            'spot_eur': row.spot_eur,
+            'tnd_1m': row.tnd_1m,
+            'usd_1m': row.usd_1m,
+            'eur_1m': row.eur_1m,
+            'tnd_3m': row.tnd_3m,
+            'usd_3m': row.usd_3m,
+            'eur_3m': row.eur_3m,
+            'tnd_6m': row.tnd_6m,
+            'usd_6m': row.usd_6m,
+            'eur_6m': row.eur_6m,
+        })
+    return jsonify(rows), 200
