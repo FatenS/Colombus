@@ -17,11 +17,13 @@ from .services.export_service import export_pdf, download_excel
 from models import db, Order, ExchangeData
 from flask_login import login_user, logout_user, current_user
 from functools import wraps
-from models import User, Role, AuditLog, PremiumRate
+from models import User, Role, AuditLog, PremiumRate, InternalEmail
 from flask_security import roles_accepted
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import current_app
+from user.routes import user_bp, fetch_rate_for_date_and_currency
+
 
 
 admin_bp = Blueprint('admin_bp', __name__, template_folder='templates', static_folder='static')
@@ -108,20 +110,17 @@ def signin():
 @admin_bp.route('api/orders', methods=['GET'])
 @jwt_required()
 def view_all_orders():
-    """
-    API for admins to view all orders in the system, regardless of the user who created them.
-    """
     orders = Order.query.options(joinedload(Order.user)).filter(Order.deleted == False).all()
-
     if not orders:
         return jsonify([]), 200
-    
+
     order_list = []
     for order in orders:
         order_list.append({
             "id": order.id,
             "user": order.user.email if order.user else "Unknown",
             "transaction_type": order.transaction_type,
+            "trade_type": order.trade_type,  # NEW: Include trade type in response
             "amount": order.amount,
             "currency": order.currency,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
@@ -132,37 +131,37 @@ def view_all_orders():
             "bank_name": order.bank_name,
             "interbank_rate": order.interbank_rate,
             "historical_loss": order.historical_loss,
-            # ADD THESE TWO LINES:
             "premium": order.premium,
-            "is_option": order.is_option
+            "is_option": order.is_option,
+            "option_type": order.option_type,     
+            "strike": order.strike,               
+            "moneyness": order.moneyness          
         })
-
     return jsonify(order_list), 200
 
+# @admin_bp.route('api/orders/<int:order_id>', methods=['PUT'])
+# @jwt_required()
+# def update_order(order_id):
+#     """
+#     API for admins to update an order's status, execution rate, and bank name.
+#     These fields are added by the admin and not by the client.
+#     """
+#     data = request.get_json()
+    
+#     # Fetch the order by ID
+#     order = Order.query.get(order_id)
+#     if not order:
+#         return jsonify({"error": "Order not found"}), 404
 
-@admin_bp.route('api/orders/<int:order_id>', methods=['PUT'])
-@jwt_required()
-def update_order(order_id):
-    """
-    API for admins to update an order's status, execution rate, and bank name.
-    These fields are added by the admin and not by the client.
-    """
-    data = request.get_json()
+#     # Admin can update these fields
+#     order.status = data.get("status", order.status)  # Update status
+#     order.execution_rate = data.get("execution_rate", order.execution_rate)  # Add/update execution rate
+#     order.bank_name = data.get("bank_name", order.bank_name)  # Add/update bank name
+#     order.historical_loss=data.get("historical_loss", order.historical_loss)
     
-    # Fetch the order by ID
-    order = Order.query.get(order_id)
-    if not order:
-        return jsonify({"error": "Order not found"}), 404
-
-    # Admin can update these fields
-    order.status = data.get("status", order.status)  # Update status
-    order.execution_rate = data.get("execution_rate", order.execution_rate)  # Add/update execution rate
-    order.bank_name = data.get("bank_name", order.bank_name)  # Add/update bank name
-    order.historical_loss=data.get("historical_loss", order.historical_loss)
+#     db.session.commit()  # Save changes
     
-    db.session.commit()  # Save changes
-    
-    return jsonify({"message": "Order updated successfully"}), 200
+#     return jsonify({"message": "Order updated successfully"}), 200
 
 
 @admin_bp.route('/run_matching', methods=['POST'])
@@ -406,17 +405,6 @@ def view_market_orders():
 #         id="scheduled_matching_job"
 #     )
 
-@admin_bp.route('/upload-file', methods=['POST'])
-def upload_file():
-    file = request.files['file']
-    df = pd.read_excel(file)
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-
-    # Save to the database without renaming columns
-    df.to_sql('exchange_data', db.engine, if_exists='replace', index=False)
-    return jsonify({"message": "File uploaded successfully"}), 200
-
-
 @admin_bp.route('/logs', methods=['GET'])
 @jwt_required()
 @roles_required('Admin')  # Restrict access to admins only
@@ -583,6 +571,7 @@ def upload_orders():
     except Exception as e:
         return jsonify({'error': f'Failed to process file: {str(e)}'}), 500
 
+# ========== ADMIN: PREMIUM RATE ENDPOINTS ==========
 
 @admin_bp.route('/api/premium-rate', methods=['POST'])
 @jwt_required()
@@ -592,18 +581,21 @@ def create_premium_rate():
     currency = data.get('currency')
     maturity_days = data.get('maturity_days')
     premium_percentage = data.get('premium_percentage')
+    option_type = data.get('option_type')  # "CALL" or "PUT"
+    transaction_type = data.get('transaction_type', 'buy')  # NEW: "buy" or "sell"
 
-    if not all([currency, maturity_days, premium_percentage]):
-        return jsonify({'error': 'Missing fields'}), 400
+    if not all([currency, maturity_days, premium_percentage, option_type, transaction_type]):
+        return jsonify({'error': 'Missing fields (currency, maturity_days, premium_percentage, option_type, transaction_type)'}), 400
 
     new_rate = PremiumRate(
         currency=currency.upper(),
         maturity_days=int(maturity_days),
         premium_percentage=float(premium_percentage),
+        option_type=option_type.upper(),  # stored as "CALL" or "PUT"
+        transaction_type=transaction_type.lower()  # store as "buy" or "sell"
     )
     db.session.add(new_rate)
     db.session.commit()
-
     return jsonify({'message': 'Premium rate created'}), 201
 
 @admin_bp.route('/api/premium-rate', methods=['GET'])
@@ -617,7 +609,9 @@ def list_premium_rates():
             'id': r.id,
             'currency': r.currency,
             'maturity_days': r.maturity_days,
-            'premium_percentage': r.premium_percentage
+            'premium_percentage': r.premium_percentage,
+            'option_type': r.option_type,
+            'transaction_type': r.transaction_type,
         })
     return jsonify(result), 200
 
@@ -631,13 +625,18 @@ def update_premium_rate(rate_id):
     currency = data.get('currency', rate.currency)
     maturity_days = data.get('maturity_days', rate.maturity_days)
     premium_percentage = data.get('premium_percentage', rate.premium_percentage)
+    option_type = data.get('option_type', rate.option_type)
+    transaction_type = data.get('transaction_type', rate.transaction_type)  # NEW
 
     rate.currency = currency.upper()
     rate.maturity_days = int(maturity_days)
     rate.premium_percentage = float(premium_percentage)
-
+    rate.option_type = option_type.upper()
+    rate.transaction_type = transaction_type.lower()
+    
     db.session.commit()
     return jsonify({'message': 'Premium rate updated'}), 200
+
 
 @admin_bp.route('/api/premium-rate/<int:rate_id>', methods=['DELETE'])
 @jwt_required()
@@ -647,134 +646,6 @@ def delete_premium_rate(rate_id):
     db.session.delete(rate)
     db.session.commit()
     return jsonify({'message': 'Premium rate deleted'}), 200
-
-# @admin_bp.route('/api/upsert-exchange-data', methods=['POST'])
-# def upsert_exchange_data():
-#     # Folder where JSON files are stored (should match your mount point)
-#     data_dir = os.path.join(current_app.root_path, 'data')
-    
-#     try:
-#         all_files = os.listdir(data_dir)
-#     except Exception as e:
-#         return jsonify({'message': f'Error accessing data directory: {str(e)}'}), 500
-
-#     # Regex patterns for the JSON filenames
-#     mid_pattern = re.compile(r"midmarket_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
-#     yield_pattern = re.compile(r"daily_yield_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
-
-#     mid_files = sorted([f for f in all_files if mid_pattern.search(f)])
-#     yield_files = sorted([f for f in all_files if yield_pattern.search(f)])
-
-#     if not mid_files or not yield_files:
-#         return jsonify({'message': 'Required JSON files are missing'}), 404
-
-#     # Use the latest files (filenames sort correctly with this format)
-#     latest_mid_file = os.path.join(data_dir, mid_files[-1])
-#     latest_yield_file = os.path.join(data_dir, yield_files[-1])
-
-#     try:
-#         with open(latest_mid_file, 'r') as f:
-#             mid_data = json.load(f)
-#         with open(latest_yield_file, 'r') as f:
-#             yield_data = json.load(f)
-#     except Exception as e:
-#         return jsonify({'message': f'Error reading JSON files: {str(e)}'}), 500
-
-#     # Process each record from midmarket data
-#     for mid_record in mid_data:
-#         try:
-#             # Convert the Timestamp to a date (ignoring time)
-#             mid_date = datetime.fromisoformat(mid_record['Timestamp']).date()
-#         except Exception:
-#             continue  # Skip record if conversion fails
-
-#         spot_usd = mid_record.get('spotUSD')
-#         spot_eur = mid_record.get('spotEUR')
-
-#         # Find a matching yield record based on date (ignoring time)
-#         matching_yield = next(
-#             (
-#                 y for y in yield_data 
-#                 if datetime.fromisoformat(y.get('Timestamp')).date() == mid_date
-#             ),
-#             None
-#         )
-#         if matching_yield:
-#             tnd_1m = matching_yield.get('Mid_TND')
-#             usd_1m = matching_yield.get('Mid_USD1M')
-#             eur_1m = matching_yield.get('Mid_EUR1M')
-#             usd_3m = matching_yield.get('Mid_USD3M')
-#             usd_6m = matching_yield.get('Mid_USD6M')
-#             eur_3m = matching_yield.get('Mid_EUR3M')
-#             eur_6m = matching_yield.get('Mid_EUR6M')
-#         else:
-#             tnd_1m = usd_1m = eur_1m = usd_3m = usd_6m = eur_3m = eur_6m = None
-
-#         # Upsert: if a record for this date exists, update it; otherwise, create a new one.
-#         record = ExchangeData.query.filter_by(date=mid_date).first()
-#         if record:
-#             record.spot_usd = spot_usd
-#             record.spot_eur = spot_eur
-#             record.tnd_1m = tnd_1m if tnd_1m is not None else record.tnd_1m
-#             record.usd_1m = usd_1m if usd_1m is not None else record.usd_1m
-#             record.eur_1m = eur_1m if eur_1m is not None else record.eur_1m
-#             record.usd_3m = usd_3m if usd_3m is not None else record.usd_3m
-#             record.usd_6m = usd_6m if usd_6m is not None else record.usd_6m
-#             record.eur_3m = eur_3m if eur_3m is not None else record.eur_3m
-#             record.eur_6m = eur_6m if eur_6m is not None else record.eur_6m
-#         else:
-#             record = ExchangeData(
-#                 date=mid_date,
-#                 spot_usd=spot_usd,
-#                 spot_eur=spot_eur,
-#                 tnd_1m=tnd_1m or 0.0,
-#                 usd_1m=usd_1m or 0.0,
-#                 eur_1m=eur_1m or 0.0,
-#                 usd_3m=usd_3m or 0.0,
-#                 usd_6m=usd_6m or 0.0,
-#                 eur_3m=eur_3m or 0.0,
-#                 eur_6m=eur_6m or 0.0,
-#                 # For TND 3M and 6M, if no values are provided in yield data,
-#                 # you can choose to default them to the 1M value or zero.
-#                 tnd_3m=tnd_1m or 0.0,
-#                 tnd_6m=tnd_1m or 0.0,
-#             )
-#             db.session.add(record)
-
-#     try:
-#         db.session.commit()
-#         return jsonify({'message': 'Exchange data upserted successfully'}), 200
-#     except Exception as e:
-#         db.session.rollback()
-#         return jsonify({'message': f'Error updating database: {str(e)}'}), 500
-
-# # (Other admin endpoints, e.g., export-pdf, can be added here as needed.)
-# @admin_bp.route('/api/debug-exchange', methods=['GET'])
-# def debug_exchange():
-#     """
-#     Simple debug endpoint to list all records from the exchange_data table.
-#     """
-#     data = ExchangeData.query.all()
-#     rows = []
-#     for row in data:
-#         rows.append({
-#             'id': row.id,
-#             'date': row.date.isoformat(),
-#             'spot_usd': row.spot_usd,
-#             'spot_eur': row.spot_eur,
-#             'tnd_1m': row.tnd_1m,
-#             'usd_1m': row.usd_1m,
-#             'eur_1m': row.eur_1m,
-#             'tnd_3m': row.tnd_3m,
-#             'usd_3m': row.usd_3m,
-#             'eur_3m': row.eur_3m,
-#             'tnd_6m': row.tnd_6m,
-#             'usd_6m': row.usd_6m,
-#             'eur_6m': row.eur_6m,
-#         })
-#     return jsonify(rows), 200
-
-
 
 @admin_bp.route('/api/upsert-exchange-data', methods=['POST'])
 def upsert_exchange_data():
@@ -952,3 +823,228 @@ def debug_exchange():
             'eur_6m': row.eur_6m,
         })
     return jsonify(rows), 200
+
+@admin_bp.route('/api/internal-emails', methods=['GET'])
+@jwt_required()
+def get_internal_emails():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    # Optional query parameter "type" to filter emails by type
+    email_type = request.args.get('type')
+    
+    # Admins see all emails; clients see only those sent to their email.
+    if "Admin" in [role.name for role in user.roles]:
+        query = InternalEmail.query
+    else:
+        query = InternalEmail.query.filter_by(recipient=user.email)
+    
+    if email_type:
+        query = query.filter_by(email_type=email_type)
+    
+    emails = query.order_by(InternalEmail.timestamp.desc()).all()
+    
+    email_list = [{
+        "id": email.id,
+        "order_id": email.order_id,
+        "email_type": email.email_type,
+        "subject": email.subject,
+        "body": email.body,
+        "sender": email.sender,
+        "recipient": email.recipient,
+        "cc": email.cc,
+        "timestamp": email.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "is_read": email.is_read
+    } for email in emails]
+    
+    return jsonify(email_list), 200
+
+@admin_bp.route('api/orders/<int:order_id>', methods=['PUT'])
+@jwt_required()
+def update_order(order_id):
+    data = request.get_json()
+    order = Order.query.get(order_id)
+    if not order:
+        return jsonify({"error": "Order not found"}), 404
+
+    old_status = order.status
+    order.status = data.get("status", order.status)
+    order.execution_rate = data.get("execution_rate", order.execution_rate)
+    order.bank_name = data.get("bank_name", order.bank_name)
+    order.historical_loss=data.get("historical_loss", order.historical_loss)
+
+    # Update any additional fields here...
+    db.session.commit()
+
+    # When the order is updated to Executed (and it was not Executed before), generate emails
+    if old_status != "Executed" and order.status == "Executed":
+        # Generate confirmation email (choose type based on trade_type; "spot" vs. "terme")
+        conf_type = "spot" if order.trade_type == "spot" else "terme"
+        subject_conf, body_conf, recipient_conf, cc_conf = generate_confirmation_email(order, conf_type)
+        confirmation_email = InternalEmail(
+            order_id=order.id,
+            email_type="confirmation",
+            subject=subject_conf,
+            body=body_conf,
+            sender="no-reply@yourcompany.com",
+            recipient=recipient_conf,
+            cc=cc_conf,
+            timestamp=datetime.utcnow(),
+            is_read=False
+        )
+        db.session.add(confirmation_email)
+
+        # Generate interbank email using your interbank email generator
+        subject_ib, body_ib, sender_ib, recipient_ib, cc_ib = generate_interbank_email(order)
+        interbank_email = InternalEmail(
+            order_id=order.id,
+            email_type="interbank",
+            subject=subject_ib,
+            body=body_ib,
+            sender=sender_ib,
+            recipient=recipient_ib,
+            cc=cc_ib,
+            timestamp=datetime.utcnow(),
+            is_read=False
+        )
+        db.session.add(interbank_email)
+
+        db.session.commit()
+
+    return jsonify({"message": "Order updated successfully"}), 200
+
+def generate_interbank_email(order):
+    """
+    Generate interbank email content based on order details.
+    Uses fetch_rate_for_date_and_currency to obtain the published interbank rate.
+    """
+    # Fetch the published rate for the order's transaction date and currency
+    published_rate = fetch_rate_for_date_and_currency(order.transaction_date, order.currency)
+    if not published_rate:
+        published_rate = "N/A"
+
+    # Calculate the difference in pips.
+    # For 'achat' (buy/import) transactions: difference = (published_rate - execution_rate) * 1000
+    # For 'vente' (sell/export) transactions: difference = (execution_rate - published_rate) * 1000
+    if order.transaction_type.lower() in ["buy", "import"]:
+        difference = (published_rate - order.execution_rate) * 1000 if published_rate != "N/A" else "N/A"
+    else:
+        difference = (order.execution_rate - published_rate) * 1000 if published_rate != "N/A" else "N/A"
+    if difference != "N/A":
+        difference = f"{difference:.2f}"
+    exec_date_str = order.transaction_date.strftime("%d/%m/%Y")
+    exec_date_phrase = order.transaction_date.strftime("%-d %B %Y")
+
+    subject = f"Performance des transactions {order.currency}/TND du {exec_date_str} par rapport au niveau interbancaire"
+    body = f"""Bonjour [M./Madame],
+
+<p>Je reviens vers vous concernant les transactions d'achat en {order.currency} effectuées le {exec_date_phrase}.<br>
+Suite à la publication du taux interbancaire par la Banque Centrale de Tunisie ({published_rate} selon la devise),<br>
+nous avons constaté que la transaction a été exécutée à un taux spot de {order.execution_rate}, soit une performance supérieure de {difference} pips par rapport au marché interbancaire, pour un montant d'achat de {order.amount} {order.currency}.</p>
+
+<p>Il est important de rappeler que le taux interbancaire représente une moyenne des transactions d'achat et de vente entre banques. Ces taux sont réels, fermes et issus d'opérations effectivement conclues sur le marché interbancaire.<br>
+Par ailleurs, ces niveaux de cotation restent généralement inaccessibles aux entreprises, étant exclusivement réservés aux institutions bancaires. Cette performance témoigne de notre engagement à optimiser les conditions de change pour nos partenaires.</p>
+
+<p>N'hésitez pas à nous contacter pour toute question ou clarification. Nous restons à votre entière disposition.</p>
+
+<p>Cordialement,<br>
+Cordialement,
+[Capture d'écran des taux interbancaires]
+"""
+    sender = "no-reply@yourcompany.com"
+    recipient = "bank@example.com"  # Adjust as needed
+    cc = None  # Optionally, add CC if required
+
+    return subject, body, sender, recipient, cc
+
+def generate_confirmation_email(order, confirmation_type):
+    """
+    Generate confirmation email content.
+    confirmation_type: "spot" or "terme"
+    """
+    if confirmation_type == "spot":
+        subject = f"Détails de l'achat {order.currency}/TND – {order.user.client_name} – Date valeur: {order.value_date.strftime('%d/%m/%Y')}"
+        body = f"""Bonjour ,
+
+Je vous prie de bien vouloir trouver ci-dessous les détails relatifs à la transaction {order.currency}/TND, validée par notre client (en copie): /n
+• Taux: {order.execution_rate}
+• Montant (en {order.currency}): {order.amount}
+• Équivalent en TND: {order.execution_rate * order.amount} (calculé sur la base d’un taux de {order.execution_rate} {order.currency}/TND)
+• Date de valeur: {order.value_date.strftime('%d/%m/%Y')}
+
+Cette transaction reflète une opération où {order.user.client_name} procède à l’achat de la devise, soit {"le dollars américain" if order.currency.upper() == "USD" else "l’euro"}, contre le dinar tunisien.
+
+Nous restons à votre disposition pour toute information complémentaire.
+Cordialement,
+"""
+        # In your real system, these addresses come from inputs or config:
+        recipient = "bank@example.com"
+        cc = order.user.email
+    elif confirmation_type == "terme":
+        subject = f"Détails des transactions vente à terme {order.currency}/TND – SBF - Domiciliation BIAT"
+        body = f"""Bonjour,
+
+Dans le cadre des récentes opérations de change {order.currency}/TND, nous vous transmettons ci-dessous un résumé détaillé de la transaction effectuée, conformément aux instructions reçues et validées par notre client (en copie):
+
+Devise: {order.currency}
+Montant encaissé: {order.amount}
+Date de valeur: {order.value_date.strftime('%d/%m/%Y')}
+Spot: [Spot Rate]
+Cours à terme: [Forward Rate]
+Montant en TND: [Calculé sur la base du taux d’exécution]
+
+Cette transaction reflète une opération où SBF procède à la vente de la devise, soit l’euro, contre le dinar tunisien.
+Je tiens également à vous informer que {order.user.client_name}, en copie, va vous confirmer cette transaction également.
+
+Nous restons à votre disposition pour toute clarification.
+Cordialement,
+"""
+        recipient = "bank@example.com"
+        cc = order.user.email
+    else:
+        raise ValueError("Invalid confirmation type")
+    return subject, body, recipient, cc
+
+import io
+import pandas as pd
+from flask import send_file
+
+@admin_bp.route('/generate-my-excel', methods=['GET'])
+@jwt_required()
+def generate_my_excel():
+    current_user_id = get_jwt_identity()  # the user’s ID from the token
+    orders = Order.query.filter_by(user_id=current_user_id).all()
+
+       # 2) Prepare list of dicts for DataFrame
+    data_rows = []
+    for o in orders:
+        data_rows.append({
+            # EXACT HEADERS from your screenshot:
+            "Date Transaction": o.transaction_date.strftime("%d/%m/%Y") if o.transaction_date else "",
+            "Date valeur": o.value_date.strftime("%d/%m/%Y") if o.value_date else "",
+            "Devise": o.currency,
+            "Type": o.transaction_type,           # e.g., "buy"/"sell" or "import"/"export"
+            "Type d’opération": o.trade_type,     # "spot"/"forward"/"option"
+            "Montant (fc)": o.original_amount,
+            "Taux d’execution": o.execution_rate or "",
+            "Banque": o.bank_name or "",
+            "Taux de référence": o.benchmark_rate or "",
+     
+        })
+
+    # 3) Convert to DataFrame
+    df = pd.DataFrame(data_rows)
+
+    # 4) Write to Excel in memory
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='OrdersData')
+    output.seek(0)
+
+    # 5) Send the file back as an attachment
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="OrdersReport.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )

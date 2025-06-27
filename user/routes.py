@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, date
 from scipy.interpolate import interp1d, CubicSpline
-from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition, PremiumRate
+from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition, PremiumRate, InterbankRate
 from matplotlib import pyplot as plt
 import numpy as np
 from flask import  request, session, jsonify, Blueprint, flash, send_from_directory
@@ -319,9 +319,17 @@ def delete_expired_positions(app):
 #         "premium": computed_premium,
 #         "debug": debug_logs
 #     }), 201
+
 @user_bp.route('/orders', methods=['POST'])
 @jwt_required()
 def submit_order_or_option():
+    """
+    Handles both normal orders AND options in a single endpoint.
+    - For options, it calculates the forward rate, determines moneyness based on strike,
+      interpolates the premium percentage, and computes the premium.
+    - For non-options, it creates a normal order.
+    Logs debug information and writes an AuditLog.
+    """
     debug_logs = []
     user_id = get_jwt_identity()
     debug_logs.append(f"Fetched user ID from JWT: {user_id}")
@@ -339,66 +347,130 @@ def submit_order_or_option():
 
     debug_logs.append(f"Raw incoming data: {data}")
 
-    # Gather necessary fields
-    transaction_type = data.get('transaction_type')
-    try:
-        amount = float(data.get('amount', 0))
-    except Exception as e:
-        return jsonify({"message": "Amount must be numeric", "debug": debug_logs}), 400
+    # Gather basic fields
+    transaction_type = data.get('transaction_type')       # "buy" / "sell"
+    amount = data.get('amount', 0)
     currency = data.get('currency')
-    value_date_str = data.get('value_date')  # expected format: "YYYY-MM-DD"
+    value_date_str = data.get('value_date')                # expected "YYYY-MM-DD"
     bank_account = data.get('bank_account')
     is_option = data.get('is_option', False)
+    
+    # For options, also accept call/put and strike
+    option_type = data.get('option_type', '').upper()      # "CALL" or "PUT"
+    user_strike = data.get('strike', None)                 # may be None
 
     if not transaction_type or not currency or not value_date_str:
         debug_logs.append("Missing required fields (transaction_type, currency, value_date).")
         return jsonify({"message": "Missing required fields", "debug": debug_logs}), 400
 
     try:
+        amount = float(amount)
         value_date = datetime.strptime(value_date_str, "%Y-%m-%d")
         debug_logs.append(
             f"Parsed data: transaction_type={transaction_type}, amount={amount}, "
             f"currency={currency}, value_date={value_date}, bank_account={bank_account}, "
-            f"is_option={is_option}"
+            f"is_option={is_option}, option_type={option_type}, strike={user_strike}"
         )
     except Exception as e:
-        debug_logs.append(f"Error parsing dates: {str(e)}")
-        return jsonify({"message": "Invalid date format", "debug": debug_logs}), 400
+        debug_logs.append(f"Error parsing data: {str(e)}")
+        return jsonify({"message": "Invalid data format", "debug": debug_logs}), 400
 
-    # Set order status based on whether it is an option
+    # Set trade_type based on whether it's an option (store "option" for options, else "spot")
+    trade_type = "option" if is_option else "spot"
     status = "Market" if is_option else "Pending"
 
     computed_premium = None
+    moneyness = None
+    computed_forward = None
+    final_strike = None
+
     if is_option:
-        # Use today's date as the trade date (or replace with a specific transaction date if needed)
-        trade_date_str = datetime.now().strftime('%d/%m/%Y')
-        echeance_str = value_date.strftime('%d/%m/%Y')
-        ttm = calculate_time_to_maturity(trade_date_str, echeance_str)
-        debug_logs.append(f"Calculated time to maturity: {ttm:.4f} years")
+        # Validate option type
+        if option_type not in ["CALL", "PUT"]:
+            debug_logs.append(f"Invalid option_type: {option_type}")
+            return jsonify({"message": "Option type must be CALL or PUT", "debug": debug_logs}), 400
 
-        # Query the PremiumRate model for the given currency
-        premium_rates = PremiumRate.query.filter_by(currency=currency.upper()).all()
+        # 1) Calculate days until maturity
+        today = datetime.now().date()
+        days_diff = (value_date.date() - today).days
+        debug_logs.append(f"Days until maturity: {days_diff}")
+
+        # 2) Retrieve today's exchange data to compute forward rate
+        exchange_data = ExchangeData.query.filter_by(date=today).first()
+        if not exchange_data:
+            debug_logs.append("No exchange data found for today's date")
+            return jsonify({"message": "Exchange data not available", "debug": debug_logs}), 400
+
+        if currency.upper() == "USD":
+            spot_rate = exchange_data.spot_usd
+            yield_foreign = getattr(exchange_data, f"usd_{get_yield_period(days_diff)[0]}m")
+        elif currency.upper() == "EUR":
+            spot_rate = exchange_data.spot_eur
+            yield_foreign = getattr(exchange_data, f"eur_{get_yield_period(days_diff)[0]}m")
+        else:
+            debug_logs.append(f"Unsupported currency: {currency}")
+            return jsonify({"message": "Unsupported currency", "debug": debug_logs}), 400
+
+        yield_domestic = getattr(exchange_data, f"tnd_{get_yield_period(days_diff)[0]}m")
+        computed_forward = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
+        debug_logs.append(f"Computed forward rate: {computed_forward}")
+
+        # 3) Determine the effective strike
+        if user_strike is not None:
+            try:
+                final_strike = float(user_strike)
+            except Exception as e:
+                debug_logs.append(f"Error parsing strike: {e}")
+                return jsonify({"message": "Strike must be numeric", "debug": debug_logs}), 400
+        else:
+            final_strike = computed_forward
+
+        # 4) Determine moneyness by comparing computed forward and strike
+        tol = 0.01 * computed_forward
+        if option_type == "CALL":
+            if computed_forward > final_strike + tol:
+                moneyness = "in the money"
+            elif abs(computed_forward - final_strike) <= tol:
+                moneyness = "at the money"
+            else:
+                moneyness = "out of the money"
+        else:  # PUT
+            if computed_forward < final_strike - tol:
+                moneyness = "in the money"
+            elif abs(computed_forward - final_strike) <= tol:
+                moneyness = "at the money"
+            else:
+                moneyness = "out of the money"
+        debug_logs.append(f"Final strike: {final_strike}, Moneyness: {moneyness}")
+
+        # 5) Fetch PremiumRate records filtered by currency, option_type, and transaction_type
+        premium_rates = PremiumRate.query.filter_by(
+            currency=currency.upper(),
+            option_type=option_type,
+            transaction_type=transaction_type.lower()
+        ).all()
         if not premium_rates:
-            debug_logs.append(f"No premium rates found for currency: {currency.upper()}")
-            return jsonify({"message": f"No premium rates found for {currency}", "debug": debug_logs}), 400
+            debug_logs.append(f"No premium rates found for {currency} {option_type} {transaction_type}")
+            return jsonify({"message": f"No premium rates found for {currency} {option_type} {transaction_type}", "debug": debug_logs}), 400
 
-        # Convert maturity_days from days to years and extract premium percentages
+        # 6) Interpolation: calculate time-to-maturity (ttm) in years
+        ttm = calculate_time_to_maturity(datetime.now().strftime('%d/%m/%Y'), value_date.strftime('%d/%m/%Y'))
+        debug_logs.append(f"Calculated time-to-maturity (years): {ttm}")
+
+        # Prepare arrays for interpolation
         known_times = np.array([r.maturity_days / 365.0 for r in premium_rates])
         known_primes = np.array([r.premium_percentage for r in premium_rates])
         debug_logs.append(f"Known times (years): {known_times}")
-        debug_logs.append(f"Known premiums: {known_primes}")
+        debug_logs.append(f"Known premium percentages: {known_primes}")
 
-        # Get interpolated premium percentages using our helper function
         interpolated = interpolate_prime(ttm, known_times, known_primes)
-        # Choose an interpolation method – here we use the linear method
         chosen_rate = float(interpolated['Linear'])
-        debug_logs.append(f"Interpolated premium percentage (Linear): {chosen_rate:.4f}")
-
-        # Calculate the premium using the interpolated premium percentage
         computed_premium = amount * chosen_rate
-        debug_logs.append(f"Computed premium: {computed_premium:.4f}")
+        debug_logs.append(
+            f"Interpolated premium rate: {chosen_rate}, Computed premium: {computed_premium}"
+        )
+    # End of is_option block
 
-    # Generate a unique order ID
     unique_id = str(uuid.uuid4())
     debug_logs.append(f"Generated unique order ID: {unique_id}")
 
@@ -407,6 +479,7 @@ def submit_order_or_option():
             id_unique=unique_id,
             user=user,
             transaction_type=transaction_type,
+            trade_type=trade_type,        # "option" for options, "spot" otherwise
             amount=amount,
             original_amount=amount,
             currency=currency,
@@ -417,8 +490,12 @@ def submit_order_or_option():
             reference=data.get('reference', f'REF-{unique_id}'),
             status=status,
             rating=user.rating,
-            premium=computed_premium,  # Computed via interpolation for options
-            is_option=is_option
+            premium=computed_premium,
+            is_option=is_option,
+            option_type=option_type if is_option else None,
+            strike=final_strike if is_option else None,
+            forward_rate=computed_forward if is_option else None,
+            moneyness=moneyness
         )
         debug_logs.append(f"Order/Option object created: {new_order}")
     except Exception as e:
@@ -434,23 +511,50 @@ def submit_order_or_option():
         debug_logs.append(f"Database error: {str(e)}")
         return jsonify({"message": "Database error", "debug": debug_logs}), 500
 
-    # (Optionally, add audit logging here.)
-    
+    try:
+        log = AuditLog(
+            action_type='create',
+            table_name='order',
+            record_id=new_order.id_unique,
+            user_id=user_id,
+            details=json.dumps({
+                "id": new_order.id_unique,
+                "transaction_type": transaction_type,
+                "amount": amount,
+                "currency": currency,
+                "value_date": value_date_str,
+                "bank_account": bank_account,
+                "is_option": is_option,
+                "option_type": option_type,
+                "strike": final_strike,
+                "premium": computed_premium,
+                "moneyness": moneyness,
+            })
+        )
+        db.session.add(log)
+        db.session.commit()
+        debug_logs.append("Audit log saved to the database")
+    except Exception as e:
+        db.session.rollback()
+        debug_logs.append(f"Error saving audit log: {str(e)}")
+        return jsonify({"message": "Error saving audit log", "debug": debug_logs}), 500
+
     return jsonify({
         "message": "Order/Option submitted successfully",
         "order_id": new_order.id_unique,
         "premium": computed_premium,
+        "moneyness": moneyness,
+        "forward_rate": computed_forward,
         "debug": debug_logs
     }), 201
 
 
-
+# =========================
+# View Orders Endpoint (for clients)
+# =========================
 @user_bp.route('/orders', methods=['GET'])
-@jwt_required()  # Ensure the user is authenticated
+@jwt_required()
 def view_orders():
-    """
-    API to view all orders submitted by the logged-in client.
-    """
     user_id = get_jwt_identity() 
     orders = Order.query.filter_by(user_id=user_id, deleted=False).all()
     
@@ -462,6 +566,7 @@ def view_orders():
         order_list.append({
             "id": order.id,
             "transaction_type": order.transaction_type,
+            "trade_type": order.trade_type,  # NEW: include trade type
             "amount": order.original_amount,
             "currency": order.currency,
             "value_date": order.value_date.strftime("%Y-%m-%d"),
@@ -469,20 +574,19 @@ def view_orders():
             "client_name": order.user.client_name,
             "premium": order.premium,       
             "is_option": order.is_option, 
+            "option_type": order.option_type,   
+            "strike": order.strike,             
+            "moneyness": order.moneyness        
         })
     
     return jsonify(order_list), 200
 
+# (Other endpoints remain largely unchanged – they can be updated similarly if needed)
 
+# =========================
+# Utility: Log Action
+# =========================
 def log_action(action_type, table_name, record_id, user_id, details):
-    """
-    Logs an action to the AuditLog table.
-    :param action_type: The type of action (create, update, delete)
-    :param table_name: The name of the table where the action was performed
-    :param record_id: The ID of the record affected
-    :param user_id: The ID of the user performing the action
-    :param details: JSON object of the changes (old and new values)
-    """
     user = User.query.get(user_id)
     details["client_name"] = user.client_name  
     log_entry = AuditLog(
@@ -491,7 +595,7 @@ def log_action(action_type, table_name, record_id, user_id, details):
         record_id=record_id,
         user_id=user_id,
         timestamp=datetime.now(),
-        details=json.dumps(details)  # Store as JSON string
+        details=json.dumps(details)
     )
     db.session.add(log_entry)
     db.session.commit()
@@ -514,41 +618,61 @@ def update_order_user(order_id):
     # Initialize a dictionary to store changes for logging
     changes = {}
 
-    # Update `amount` and `original_amount` while keeping a log of the original values
+    # Update `amount` and `original_amount`
     if 'amount' in data and data['amount'] != order.amount:
         changes['original_amount'] = {"old": order.original_amount, "new": data['amount']}
         changes['amount'] = {"old": order.amount, "new": data['amount']}
-        
-        # Update both fields with the new value
         order.amount = data['amount']
         order.original_amount = data['amount']
 
-    # Update other allowed fields
+    # Update currency
     if 'currency' in data and data['currency'] != order.currency:
         changes['currency'] = {"old": order.currency, "new": data['currency']}
         order.currency = data['currency']
-        
+
+    # Update value_date
     if 'value_date' in data:
         new_value_date = datetime.strptime(data['value_date'], "%Y-%m-%d")
         if new_value_date != order.value_date:
             changes['value_date'] = {"old": order.value_date.strftime("%Y-%m-%d"), "new": data['value_date']}
             order.value_date = new_value_date
-    
+
+    # Update bank_account
     if 'bank_account' in data and data['bank_account'] != order.bank_account:
         changes['bank_account'] = {"old": order.bank_account, "new": data['bank_account']}
         order.bank_account = data['bank_account']
-        
+
+    # Update reference
     if 'reference' in data and data['reference'] != order.reference:
         changes['reference'] = {"old": order.reference, "new": data['reference']}
         order.reference = data['reference']
 
-    # Log the update action with old and new values
+    # NEW: Update trade_type if provided
+    if 'trade_type' in data and data['trade_type'] != order.trade_type:
+        changes['trade_type'] = {"old": order.trade_type, "new": data['trade_type']}
+        order.trade_type = data['trade_type']
+
+    # Optionally update option-specific fields if this is an option order
+    if order.is_option:
+        if 'option_type' in data and data['option_type'] != order.option_type:
+            changes['option_type'] = {"old": order.option_type, "new": data['option_type']}
+            order.option_type = data['option_type']
+        if 'strike' in data:
+            try:
+                new_strike = float(data['strike']) if data['strike'] is not None else None
+            except Exception:
+                return jsonify({"error": "Strike must be numeric"}), 400
+            if new_strike != order.strike:
+                changes['strike'] = {"old": order.strike, "new": new_strike}
+                order.strike = new_strike
+
+    # Log the update action with all changes
     log_action(
         action_type='update',
         table_name='order',
         record_id=order.id_unique,
         user_id=user_id,
-        details=changes  # Log the changes dictionary directly
+        details=changes
     )
 
     db.session.commit()
@@ -944,8 +1068,6 @@ def dashboard_summary():
     return jsonify(summary_data)
 
 
-
-
 @user_bp.route('/api/dashboard/secured-vs-market-forward-rate', methods=['GET'])
 @jwt_required()
 def forward_rate_table():
@@ -998,7 +1120,6 @@ def superperformance_trend():
     orders = Order.query.filter(
         Order.user_id == user_id,
         Order.currency == currency,
-        Order.transaction_type.in_(['Import', 'buy']),
         Order.status.in_(['Executed', 'Matched'])
     ).order_by(Order.transaction_date).all()
 
@@ -1009,7 +1130,8 @@ def superperformance_trend():
     for order in orders:
         trend_data.append({
             "date": order.transaction_date.strftime('%Y-%m-%d'),
-            "execution_rate": order.execution_rate,
+            "execution_rate_export": order.execution_rate if order.transaction_type.lower() in ["export", "sell"] else None,
+            "execution_rate_import": order.execution_rate if order.transaction_type.lower() in ["import", "buy"] else None,
             "interbank_rate": order.interbank_rate  # Already updated in the database
         })
 
@@ -1045,74 +1167,147 @@ def bank_gains():
     # Get the currency from query parameters (default to USD)
     currency = request.args.get("currency", "USD").upper()
 
-    # Filter orders by currency
+    # Filter orders by currency and status
     orders = Order.query.filter(
         Order.user_id == user_id,
         Order.currency == currency,
-        Order.status.in_(['Executed', 'Matched'])  # Add status filter
+        Order.status.in_(['Executed', 'Matched'])
     ).all()
 
-    # Group data by bank and month
+    # Process each order: calculate gain and gain_percentage and save in DB.
+    for order in orders:
+        try:
+            benchmark = calculate_benchmark(order)
+        except Exception as e:
+            # If benchmark calculation fails, set it to None
+            benchmark = None
+
+        if benchmark and order.execution_rate:
+            tx_type = order.transaction_type.lower()
+            if tx_type in ["import", "buy"]:
+                gain_percent = (benchmark / order.execution_rate) - 1
+            else:
+                gain_percent = (order.execution_rate / benchmark) - 1
+
+            # Convert foreign notional to domestic (TND) using the execution_rate
+            gain = gain_percent * order.original_amount * order.execution_rate
+
+            order.gain = float(gain)
+            order.gain_percentage = float(gain_percent * 100)
+        else:
+            order.gain = 0
+            order.gain_percentage = 0
+
+    # Commit updates to the database.
+    db.session.commit()
+
+    # Group orders by bank and month for the API response.
     bank_data = {}
     for order in orders:
-        # Determine month and bank
         month = order.transaction_date.strftime('%Y-%m')
         bank = order.bank_name or "Unknown"
-
         if bank not in bank_data:
             bank_data[bank] = {}
         if month not in bank_data[bank]:
             bank_data[bank][month] = {'traded': 0, 'gain': 0, 'coverage': 0, 'count': 0}
-
-        # Calculate hedge_status and benchmark
-        hedge_status = calculate_hedge_status(order.transaction_date, order.value_date)
-        order.hedge_status = hedge_status
-        benchmark = calculate_benchmark(order)
-
-        # Update metrics
-        bank_data[bank][month]['traded'] += order.original_amount
+        
+        # Convert original_amount from foreign currency to TND.
+        traded_tnd = order.original_amount * order.execution_rate if order.execution_rate else 0
+        bank_data[bank][month]['traded'] += traded_tnd
         bank_data[bank][month]['count'] += 1
+        bank_data[bank][month]['gain'] += order.gain
 
+        hedge_status = calculate_hedge_status(order.transaction_date, order.value_date)
         if hedge_status == "Yes":
-            bank_data[bank][month]['coverage'] += order.original_amount
+            bank_data[bank][month]['coverage'] += traded_tnd
 
-        # ---------------------------------------------
-        # FIX: Distinguish import/buy vs. export/sell
-        # ---------------------------------------------
-        if benchmark and order.execution_rate:
-            tx_type = order.transaction_type.lower()
-            if tx_type in ["import", "buy"]:
-                # Gains% = (Benchmark / ExecRate) - 1
-                gain_percent = (benchmark / order.execution_rate) - 1
-            else:
-                # Gains% = (ExecRate / Benchmark) - 1
-                gain_percent = (order.execution_rate / benchmark) - 1
-            
-            bank_data[bank][month]['gain'] += gain_percent * order.original_amount
-
-    # Format data for the table
     formatted_data = []
     for bank, months in bank_data.items():
         for month, stats in months.items():
-            coverage_percent = (stats['coverage'] / stats['traded'] * 100) if stats['traded'] > 0 else 0
+            traded = stats['traded']
+            coverage_percent = (stats['coverage'] / traded * 100) if traded > 0 else 0
+            # Weighted gain percentage calculated in TND
+            gain_percentage = (stats['gain'] / traded * 100) if traded > 0 else 0
             formatted_data.append({
                 "bank": bank,
                 "month": month,
-                "total_traded": stats['traded'],
-                "coverage_percent": coverage_percent,
-                "gain": stats['gain']  # Gains in foreign currency if ExecRate is TND/FC
+                "total_traded": round(traded, 2),
+                "coverage_percent": round(coverage_percent, 2),
+                "gain": round(stats['gain'], 2),
+                "gain_percentage": round(gain_percentage, 2)
             })
 
     return jsonify(formatted_data)
+
 
 
 def calculate_hedge_status(transaction_date, value_date):
     return "Yes" if (value_date - transaction_date).days > 2 else "No"
 
 
-def calculate_benchmark(order):
+# def calculate_benchmark(order):
 
-    # Fetch exchange data for the order's transaction date
+#     # Fetch exchange data for the order's transaction date
+#     try:
+#         exchange_data_df = pd.read_sql(
+#             'SELECT * FROM exchange_data WHERE "Date" = %(transaction_date)s',
+#             db.engine,
+#             params={"transaction_date": order.transaction_date.strftime("%Y-%m-%d")}
+#         )
+#     except Exception as e:
+#         raise ValueError(f"Failed to fetch exchange data: {e}")
+
+#     # Ensure exchange data is available
+#     if exchange_data_df.empty:
+#         raise ValueError(f"No exchange data available for date {order.transaction_date}")
+
+#     # Extract the spot rate for the order's currency
+#     try:
+#         spot_rate = exchange_data_df[f'Spot {order.currency.upper()}'].values[0]
+#     except KeyError:
+#         raise ValueError(f"Spot rate for {order.currency} not found in exchange data for {order.transaction_date}")
+
+#     # Validate historical loss
+#     historical_loss = getattr(order, 'historical_loss', None)
+#     if historical_loss is None:
+#         raise ValueError("Historical loss is missing for the order, cannot calculate benchmark.")
+
+#     # Adjust spot rate based on transaction type
+#     if order.transaction_type.lower() in ["import", "buy"]:
+#         loss_factor = 1 + historical_loss
+#     elif order.transaction_type.lower() in ["export", "sell"]:
+#         loss_factor = 1 - historical_loss
+#     else:
+#         raise ValueError(f"Unsupported transaction type: {order.transaction_type}")
+
+#     base_benchmark = spot_rate * loss_factor
+
+#     # Calculate hedge status and days difference
+#     days_diff = (order.value_date - order.transaction_date).days
+#     hedge_status = "Yes" if days_diff > 2 else "No"
+
+#     # If hedged, apply forward rate adjustment
+#     if hedge_status == "Yes":
+#         yield_period = get_yield_period(days_diff)  # Determine yield period (1m, 3m, or 6m)
+#         try:
+#             yield_foreign = exchange_data_df[f'{yield_period.upper()} {order.currency.upper()}'].values[0]
+#             yield_domestic = exchange_data_df[f'{yield_period.upper()} TND'].values[0]
+#         except KeyError as e:
+#             raise ValueError(f"Missing yield data for {yield_period} and currency {order.currency}: {e}")
+
+#         # Calculate forward rate factor
+#         forward_rate_factor = calculate_forward_rate(base_benchmark, yield_foreign, yield_domestic, days_diff)
+#         return  forward_rate_factor
+
+#     # Return the base benchmark for non-hedged transactions
+#     return base_benchmark
+
+def calculate_benchmark(order):
+    """
+    Calcule le benchmark (taux de référence) pour une commande.
+    Si la commande est hedgée (écart > 2 jours entre transaction_date et value_date),
+    on applique une correction via le taux forward.
+    """
     try:
         exchange_data_df = pd.read_sql(
             'SELECT * FROM exchange_data WHERE "Date" = %(transaction_date)s',
@@ -1120,87 +1315,87 @@ def calculate_benchmark(order):
             params={"transaction_date": order.transaction_date.strftime("%Y-%m-%d")}
         )
     except Exception as e:
-        raise ValueError(f"Failed to fetch exchange data: {e}")
+        raise ValueError(f"Échec de récupération des données de change : {e}")
 
-    # Ensure exchange data is available
     if exchange_data_df.empty:
-        raise ValueError(f"No exchange data available for date {order.transaction_date}")
+        raise ValueError(f"Aucune donnée de change disponible pour la date {order.transaction_date}")
 
-    # Extract the spot rate for the order's currency
-    try:
-        spot_rate = exchange_data_df[f'Spot {order.currency.upper()}'].values[0]
-    except KeyError:
-        raise ValueError(f"Spot rate for {order.currency} not found in exchange data for {order.transaction_date}")
+    # Utiliser exactement les clés définies dans le modèle
+    if order.currency.upper() == "USD":
+        spot_rate = exchange_data_df["Spot USD"].values[0]
+    elif order.currency.upper() == "EUR":
+        spot_rate = exchange_data_df["Spot EUR"].values[0]
+    else:
+        raise ValueError(f"Devise non supportée : {order.currency}")
 
-    # Validate historical loss
+    # Vérifier que historical_loss est défini
     historical_loss = getattr(order, 'historical_loss', None)
     if historical_loss is None:
-        raise ValueError("Historical loss is missing for the order, cannot calculate benchmark.")
+        raise ValueError("Historical loss manquant pour la commande, impossible de calculer le benchmark.")
 
-    # Adjust spot rate based on transaction type
-    if order.transaction_type.lower() in ["import", "buy"]:
+    # Ajuster le taux au comptant selon le type de transaction
+    transaction_type = order.transaction_type.lower()
+    if transaction_type in ["import", "buy"]:
         loss_factor = 1 + historical_loss
-    elif order.transaction_type.lower() in ["export", "sell"]:
+    elif transaction_type in ["export", "sell"]:
         loss_factor = 1 - historical_loss
     else:
-        raise ValueError(f"Unsupported transaction type: {order.transaction_type}")
+        raise ValueError(f"Type de transaction non supporté : {order.transaction_type}")
 
     base_benchmark = spot_rate * loss_factor
 
-    # Calculate hedge status and days difference
+    # Calculer la différence de jours entre transaction_date et value_date
     days_diff = (order.value_date - order.transaction_date).days
     hedge_status = "Yes" if days_diff > 2 else "No"
 
-    # If hedged, apply forward rate adjustment
     if hedge_status == "Yes":
-        yield_period = get_yield_period(days_diff)  # Determine yield period (1m, 3m, or 6m)
-        try:
-            yield_foreign = exchange_data_df[f'{yield_period.upper()} {order.currency.upper()}'].values[0]
-            yield_domestic = exchange_data_df[f'{yield_period.upper()} TND'].values[0]
-        except KeyError as e:
-            raise ValueError(f"Missing yield data for {yield_period} and currency {order.currency}: {e}")
+        # Obtenir la période de yield sous la forme "1m", "3m" ou "6m"
+        yield_period = get_yield_period(days_diff)  # Doit renvoyer "1m", "3m" ou "6m"
+        # Convertir en format majuscule pour correspondre aux clés (ex. "1M")
+        period_mapping = {"1m": "1M", "3m": "3M", "6m": "6M"}
+        period_key = period_mapping[yield_period]
 
-        # Calculate forward rate factor
+        # Récupérer le taux étranger selon la devise
+        if order.currency.upper() == "USD":
+            yield_foreign = exchange_data_df[f"{period_key} USD"].values[0]
+        elif order.currency.upper() == "EUR":
+            yield_foreign = exchange_data_df[f"{period_key} EUR"].values[0]
+        else:
+            raise ValueError(f"Devise non supportée pour le yield : {order.currency}")
+
+        # Récupérer le taux domestique (TND)
+        yield_domestic = exchange_data_df[f"{period_key} TND"].values[0]
+
+        # Calculer et renvoyer le taux forward ajusté
         forward_rate_factor = calculate_forward_rate(base_benchmark, yield_foreign, yield_domestic, days_diff)
-        return  forward_rate_factor
+        return forward_rate_factor
 
-    # Return the base benchmark for non-hedged transactions
     return base_benchmark
 
 
 from flask import current_app
 
-@user_bp.route('/update-interbank-rates', methods=['POST'])
-def update_interbank_rates():
-    try:
-        update_order_interbank_rates(current_app)  # pass in current_app
-        return jsonify({'message': 'Interbank rates updated successfully'}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+# Helper: Get interbank rate from DB using the order’s transaction_date.
+def get_interbank_rate_from_db(date, currency):
+    # First try an exact match
+    rate_entry = InterbankRate.query.filter_by(date=date, currency=currency).first()
+    if rate_entry:
+        return rate_entry.rate
+    # Otherwise, return the latest available rate before the given date.
+    rate_entry = InterbankRate.query.filter(
+        InterbankRate.date < date,
+        InterbankRate.currency == currency
+    ).order_by(InterbankRate.date.desc()).first()
+    if rate_entry:
+        return rate_entry.rate
+    return None
 
-def update_order_interbank_rates(app):
-    with app.app_context():
-        try:
-            orders = Order.query.all()
-            for order in orders:
-                if order.interbank_rate is None:  # Only fetch rates for orders missing this value
-                    rate = fetch_rate_for_date_and_currency(order.transaction_date, order.currency)
-                    if rate:
-                        print(f"Updating Order ID {order.id} with rate {rate}")
-                        order.interbank_rate = rate
-                        db.session.add(order)
-            db.session.commit()
-        except Exception as e:
-            print(f"Error updating interbank rates: {e}")
-
-
-
+# Helper: Fetch interbank rate from external source (e.g., BCT website)
 def fetch_rate_for_date_and_currency(date, currency):
     formatted_date = date.strftime('%Y-%m-%d')
     response = requests.post(f"https://www.bct.gov.tn/bct/siteprod/cours_archiv.jsp?input={formatted_date}&langue=en")
     soup = BeautifulSoup(response.content, 'html.parser')
     rate = None
-    # Parsing logic specifically tailored for the structure of the BCT site
     rows = soup.find_all('tr')
     for row in rows:
         cells = row.find_all('td')
@@ -1209,6 +1404,85 @@ def fetch_rate_for_date_and_currency(date, currency):
             break
     return rate
 
+def update_interbank_rates_db_logic(start_date_str="2024-08-01"):
+    from datetime import datetime, timedelta
+    # Parse the start date
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        print("Invalid start_date format, expected YYYY-MM-DD")
+        return {"error": "Invalid start_date format, expected YYYY-MM-DD"}
+
+    end_date = datetime.today().date()
+    currencies = ["USD", "EUR"]  # Extend as needed.
+    updated_entries = []
+
+    for n in range((end_date - start_date).days + 1):
+        current_date = start_date + timedelta(days=n)
+        for currency in currencies:
+            if not InterbankRate.query.filter_by(date=current_date, currency=currency).first():
+                rate = fetch_rate_for_date_and_currency(current_date, currency)
+                if rate:
+                    new_rate = InterbankRate(date=current_date, currency=currency, rate=rate)
+                    db.session.add(new_rate)
+                    updated_entries.append({
+                        "date": current_date.isoformat(),
+                        "currency": currency,
+                        "rate": rate
+                    })
+    try:
+        db.session.commit()
+        print("Interbank rates DB updated successfully", updated_entries)
+        return {"message": "Interbank rates DB updated successfully", "updated": updated_entries}
+    except Exception as e:
+        db.session.rollback()
+        print("Error updating interbank rates DB:", e)
+        return {"error": str(e)}
+
+@user_bp.route('/update-interbank-rates-db', methods=['POST'])
+def update_interbank_rates_db_endpoint():
+    data = request.get_json() or {}
+    start_date_str = data.get("start_date", "2024-08-01")
+    result = update_interbank_rates_db_logic(start_date_str)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result), 200
+
+
+# Update orders: Use transaction_date to look up the interbank rate and update the order.
+@user_bp.route('/update-interbank-rates', methods=['POST'])
+def update_interbank_rates():
+    try:
+        update_order_interbank_and_benchmark_rates(current_app)
+        return jsonify({'message': 'Orders updated with interbank & benchmark rates successfully'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def update_order_interbank_and_benchmark_rates(app):
+    with app.app_context():
+        try:
+            orders = Order.query.all()
+            for order in orders:
+                if order.interbank_rate is None:
+                    rate = get_interbank_rate_from_db(order.transaction_date, order.currency)
+                    if rate:
+                        order.interbank_rate = float(rate)
+
+                # Ensure conversion from np.float64 to Python float
+                try:
+                    benchmark = calculate_benchmark(order)
+                    order.benchmark_rate = float(benchmark)
+                except Exception as ex:
+                    print(f"Error calculating benchmark for Order ID {order.id}: {ex}")
+
+                db.session.add(order)
+
+            db.session.commit()
+            print("Orders successfully updated")
+
+        except Exception as e:
+            db.session.rollback()
+            print(f"Error updating orders: {e}")
 
 
 # import eikon as ek
@@ -1256,3 +1530,122 @@ def interpolate_prime(time_to_maturity, known_times, known_primes):
         'Quadratic': quadratic_interp(time_to_maturity),
         'CubicSpline': cubic_spline(time_to_maturity),
     }
+@user_bp.route('/orders/preview', methods=['POST'])
+@jwt_required()
+def preview_option():
+    """
+    Preview an option order by computing the forward rate, premium, moneyness, and default strike.
+    This endpoint does NOT create an order.
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"message": "No data provided"}), 400
+
+    # Extract fields from request payload
+    try:
+        amount = float(data.get("amount", 0))
+        transaction_type = data.get("transaction_type")
+        value_date_str = data.get("value_date")
+        currency = data.get("currency")
+        bank_account = data.get("bank_account")
+        is_option = data.get("is_option", False)
+        option_type = data.get("option_type", "").upper()
+        strike = data.get("strike")
+    except Exception as e:
+        return jsonify({"message": f"Invalid data format: {e}"}), 400
+
+    if not (transaction_type and value_date_str and currency and bank_account):
+        return jsonify({"message": "Missing required fields"}), 400
+
+    # Parse the value date
+    try:
+        value_date = datetime.strptime(value_date_str, "%Y-%m-%d")
+    except Exception as e:
+        return jsonify({"message": "Invalid date format"}), 400
+
+    if not is_option:
+        return jsonify({"message": "Preview is only available for options"}), 400
+
+    # Retrieve exchange data (using today's date as an example)
+    today = datetime.today().date()
+    exchange_data = ExchangeData.query.filter_by(date=today).first()
+    if not exchange_data:
+        return jsonify({"message": "Exchange data for today not available"}), 400
+
+    # Calculate days difference
+    days_diff = (value_date.date() - today).days
+    period = get_yield_period(days_diff)
+    if currency.upper() == 'USD':
+        spot_rate = exchange_data.spot_usd
+        yield_foreign = getattr(exchange_data, f"usd_{period[0]}m")
+    elif currency.upper() == 'EUR':
+        spot_rate = exchange_data.spot_eur
+        yield_foreign = getattr(exchange_data, f"eur_{period[0]}m")
+    else:
+        return jsonify({"message": "Unsupported currency"}), 400
+
+    yield_domestic = getattr(exchange_data, f"tnd_{period[0]}m")
+
+    # Compute the forward rate using your helper function
+    computed_forward = calculate_forward_rate(spot_rate, yield_foreign, yield_domestic, days_diff)
+
+    # Determine moneyness based on strike if provided; if not, use computed_forward as strike
+    tol = 0.01 * computed_forward
+    if strike is not None:
+        try:
+            strike_value = float(strike)
+        except Exception:
+            return jsonify({"message": "Strike must be numeric"}), 400
+    else:
+        strike_value = computed_forward
+
+    if option_type == "CALL":
+        if computed_forward > strike_value + tol:
+            moneyness = "in the money"
+        elif abs(computed_forward - strike_value) <= tol:
+            moneyness = "at the money"
+        else:
+            moneyness = "out of the money"
+    elif option_type == "PUT":
+        if computed_forward < strike_value - tol:
+            moneyness = "in the money"
+        elif abs(computed_forward - strike_value) <= tol:
+            moneyness = "at the money"
+        else:
+            moneyness = "out of the money"
+    else:
+        return jsonify({"message": "Option type must be CALL or PUT"}), 400
+
+    # Compute premium using your interpolation logic.
+    premium_rates = PremiumRate.query.filter_by(currency=currency.upper(), option_type=option_type, transaction_type=transaction_type  # NEW: filter for "buy" or "sell"
+).all()
+    if not premium_rates:
+        return jsonify({"message": f"No premium rates found for {currency} {option_type}"}), 400
+
+    ttm = calculate_time_to_maturity(datetime.now().strftime('%d/%m/%Y'), value_date.strftime('%d/%m/%Y'))
+    known_times = np.array([r.maturity_days / 365.0 for r in premium_rates])
+    known_primes = np.array([r.premium_percentage for r in premium_rates])
+    interpolated = interpolate_prime(ttm, known_times, known_primes)
+    chosen_rate = float(interpolated['Linear'])
+    computed_premium = amount * chosen_rate
+
+    # Return the computed preview values as JSON
+    return jsonify({
+        "forward_rate": computed_forward,
+        "premium": computed_premium,
+        "moneyness": moneyness,
+
+        "strike": strike_value,  # Will equal computed_forward if no strike was provided
+    }), 200
+@user_bp.route('/get-interbank-rates', methods=['GET'])
+def get_interbank_rates():
+    try:
+        rates = InterbankRate.query.all()
+        result = [{
+            "date": rate.date.strftime("%Y-%m-%d"),
+            "currency": rate.currency,
+            "rate": rate.rate
+        } for rate in rates]
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

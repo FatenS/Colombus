@@ -1,8 +1,8 @@
 from flask import Flask
 from flask_cors import CORS
 from models import db, User, Role
-from admin.routes import admin_bp 
-from user.routes import user_bp, init_socketio, delete_expired_positions, update_order_interbank_rates
+from admin.routes import admin_bp
+from user.routes import user_bp, init_socketio, delete_expired_positions, update_order_interbank_and_benchmark_rates, update_interbank_rates_db_logic
 from scheduler import scheduler, start_scheduler
 from scheduler_jobs import check_for_new_files
 from flask_security import Security, SQLAlchemySessionUserDatastore
@@ -61,12 +61,19 @@ scheduler.add_job(
 # 3) Add daily job to update interbank rates (24h interval)
 # ------------------------------------------------------------
 scheduler.add_job(
-    func=update_order_interbank_rates,
+    func=update_order_interbank_and_benchmark_rates,
     trigger='interval',
-    hours=24,
+    minutes=5,
     kwargs={'app': app},
     id="update_order_interbank_rates_job"
 )
+scheduler.add_job(
+    func=lambda: update_interbank_rates_db_logic("2024-08-01"),
+    trigger='interval',
+    minutes=1440,  # once per day, or change as needed
+    id="update_interbank_rates_db_job"
+)
+
 
 # Start the scheduler
 start_scheduler()

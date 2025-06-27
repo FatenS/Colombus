@@ -85,8 +85,17 @@ class Order(db.Model):
     matched_order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=True)  
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     matched_amount = db.Column(db.Float, nullable=True, default=0.0)  
+    option_type = db.Column(db.String(10), nullable=True)  # "CALL"/"PUT"
+    strike = db.Column(db.Float, nullable=True)            # user input or None
+    forward_rate = db.Column(db.Float, nullable=True)      # store the computed forward
+    moneyness = db.Column(db.String(20), nullable=True) 
     premium = db.Column(db.Float, nullable=True)  # If not NULL => it's an Option
     is_option = db.Column(db.Boolean, default=False)
+    trade_type = db.Column(db.String(10), nullable=False, default="spot")  #  "spot", "forward", or "option"
+    benchmark_rate = db.Column(db.Float, nullable=True, default=None)  # NEW: saved benchmark
+    gain = db.Column(db.Float, nullable=True, default=0)
+    gain_percentage = db.Column(db.Float, nullable=True, default=0)
+
 
     # Relationships
     user = db.relationship('User', backref='orders', lazy=True)
@@ -131,6 +140,10 @@ class PremiumRate(db.Model):
     currency = db.Column(db.String(3), nullable=False)    # e.g., 'USD', 'EUR'
     maturity_days = db.Column(db.Integer, nullable=False) # e.g., 30, 60, 90
     premium_percentage = db.Column(db.Float, nullable=False)
+    option_type = db.Column(db.String(4), nullable=False)  # "CALL" or "PUT"
+    # In your PremiumRate model:
+    transaction_type = db.Column(db.String(4), nullable=False, default="buy")
+
 
 
 class AuditLog(db.Model):
@@ -144,3 +157,26 @@ class AuditLog(db.Model):
     details = db.Column(db.Text)  # JSON string 
 
     user = db.relationship('User', backref='audit_logs')
+# New model for storing interbank rates
+class InterbankRate(db.Model):
+    __tablename__ = 'interbank_rate'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False)
+    currency = db.Column(db.String(3), nullable=False)
+    rate = db.Column(db.Float, nullable=False)
+    __table_args__ = (db.UniqueConstraint('date', 'currency', name='uix_date_currency'),)
+
+class InternalEmail(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=True)
+    email_type = db.Column(db.String(50), nullable=False)  # e.g., "confirmation" or "interbank"
+    subject = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    sender = db.Column(db.String(255), nullable=False)
+    recipient = db.Column(db.String(255), nullable=False)
+    cc = db.Column(db.String(255))  # comma-separated list if needed
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+
+    # Optional relationship to Order:
+    order = db.relationship('Order', backref='internal_emails', lazy=True)
