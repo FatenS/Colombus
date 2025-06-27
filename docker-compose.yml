@@ -1,20 +1,22 @@
 services:
   db:
-    image: postgres
+    image: postgres:16
     restart: always
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_PASSWORD: pass123
+      POSTGRES_PASSWORD: pass123        
 
   app:
     build: .
     restart: always
     ports:
       - "5001:5001"
+    env_file:
+      - .env                            
     environment:
-      DATABASE_URL: "postgres://postgres:pass123@db:5432/postgres"
-      EIKON_APP_KEY: "20af0572a6364fe8abf9a35cdd16bd367057564a"
+      # keep only things that are NOT in .env
+      DATABASE_URL: postgres://postgres:pass123@db:5432/postgres
     volumes:
       - ./data:/app/data
     depends_on:

@@ -17,7 +17,7 @@ rics = ['EUR02H=', 'TND02H=']
 yield_rics = ['USD1MD=', 'USD3MD=', 'USD6MD=', 'EUR1MD=', 'EUR3MD=', 'EUR6MD=', 'TNDOND=']
 
 # Set start and end dates
-start_date = datetime.datetime(2024, 8, 1)
+start_date = datetime.datetime(2020, 1, 1)
 end_date = datetime.datetime.today()
 
 # Create the "data" folder if it doesn't exist
@@ -58,13 +58,19 @@ try:
         print(f"Midmarket rates saved to {mid_filename}.")
 
     ###### Fetch and Process Yield Data ######
+     # fetch daily yields (no DATE field needed—you get the date as the index)
     yield_df = rd.get_history(
         universe=yield_rics,
-        fields=['BID', 'ASK', 'DATE'],
+        fields=['BID', 'ASK'],
         start=start_date,
         end=end_date,
-        interval='hourly'
+        interval='daily'
     )
+
+    # name the index 'Timestamp' so reset_index() will give you exactly that column
+    yield_df.index      = pd.to_datetime(yield_df.index)
+    yield_df.index.name = 'Timestamp'
+    yield_df = yield_df.reset_index()
 
     if yield_df.empty:
         print("No data available for Yields.")

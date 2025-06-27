@@ -10,23 +10,31 @@ import pandas as pd
 from fpdf import FPDF
 from sqlalchemy.orm import joinedload
 from collections import defaultdict
-from flask import Blueprint, render_template, request, redirect, url_for, send_file, make_response, jsonify, flash, session
+from flask import Blueprint, abort, render_template, request, redirect, url_for, send_file, make_response, jsonify, flash, session
 from datetime import datetime, timedelta
 from sqlalchemy import func
 from .services.export_service import export_pdf, download_excel
 from models import db, Order, ExchangeData
 from flask_login import login_user, logout_user, current_user
 from functools import wraps
-from models import User, Role, AuditLog, PremiumRate, InternalEmail
+from models import User, Role, AuditLog, PremiumRate, InternalEmail, BctxFixing, TcaSpotInput
 from flask_security import roles_accepted
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, get_jwt_identity, jwt_required, get_jwt, unset_jwt_cookies
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import current_app
-from user.routes import user_bp, fetch_rate_for_date_and_currency
+from user.routes import require_reference_if_needed, user_bp, fetch_rate_for_date_and_currency
+from extentions import limiter, revoke_token          
 
 
 
 admin_bp = Blueprint('admin_bp', __name__, template_folder='templates', static_folder='static')
+PWD_RE = re.compile(r"^(?=.*[A-Z])(?=.*[a-z])(?=.*\d).{8,}$")
+
+def _validate_pwd(pwd):
+    if not PWD_RE.match(pwd):
+        raise ValueError(
+            "Mot de passe trop faible : 8 caractères mini + majuscule + minuscule + chiffre"
+        )
 
 # Custom roles_required decorator
 def roles_required(required_role):
@@ -34,7 +42,7 @@ def roles_required(required_role):
         @wraps(fn)
         def decorator(*args, **kwargs):
             # Get the user identity from the JWT token
-            user_id = get_jwt_identity()
+            user_id = int(get_jwt_identity())
             user = User.query.get(user_id)
             
             if not user:
@@ -56,12 +64,12 @@ class JSONEncoder(json.JSONEncoder):
             return int(obj)
         return json.JSONEncoder.default(self, obj)
 
-
 def generate_unique_key(buyer, seller):
     # Create a unique key based on the first 2 letters of buyer and seller names and 8 random digits
     random_digits = ''.join(random.choices(string.digits, k=8))
     return buyer[:1] + seller[:1] + random_digits
 
+@limiter.limit("5 per minute")
 @admin_bp.route('/signup', methods=['GET', 'POST'])
 def sign():
     email = request.json.get('email')
@@ -69,6 +77,13 @@ def sign():
     client_name = request.json.get('client_name')  
     role_id = request.json.get('options')
     rating = request.json.get('rating', 0)  
+
+    # ─── 1. contrôle de robustesse du mot de passe ──────────
+    try:
+        _validate_pwd(password)                     # ← AJOUTE CES 4 LIGNES
+    except ValueError as e:
+        return jsonify(msg=str(e)), 400
+    # ─────────────────────────────────────────────────────────
 
     if User.query.filter_by(email=email).first():
         return jsonify({"msg": "User already exists"}), 400
@@ -85,27 +100,119 @@ def sign():
     db.session.commit()
 
     return jsonify({"msg": "User created successfully!"}), 201
+from flask_jwt_extended import (
+    create_access_token, create_refresh_token,
+    set_access_cookies, set_refresh_cookies,
+    unset_jwt_cookies, get_jwt, get_jwt_identity,
+    jwt_required
+)
 
 @admin_bp.route('/signin', methods=['GET', 'POST'])
 def signin():
-    email = request.json.get('email')
-    password = request.json.get('password')
+    debug_msgs = []
+    debug_msgs.append(f"BODY: {request.data}")
+    try:
+        data = request.get_json(force=True)
+        debug_msgs.append(f"JSON: {data}")
+    except Exception as e:
+        debug_msgs.append(f"JSON decode error: {str(e)}")
+        return jsonify(msg="Bad JSON", debug=debug_msgs), 400
+
+    email = data.get("email")
+    pwd = data.get("password")
+    debug_msgs.append(f"Email: {email}")
+
     user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password, pwd):
+        debug_msgs.append("User not found or bad password")
+        return jsonify(msg="Invalid email or password", debug=debug_msgs), 401
 
-    if user and check_password_hash(user.password, password):
-        # Create JWT token
-        access_token = create_access_token(identity=str(user.id))  # Ensure identity is a string
+    access  = create_access_token(identity=str(user.id), fresh=True)
+    refresh = create_refresh_token(identity=str(user.id))
+    debug_msgs.append(f"Access/refresh token created for user id {user.id}")
+    resp = jsonify(roles=[r.name for r in user.roles], debug=debug_msgs)
+    set_access_cookies(resp, access)
+    set_refresh_cookies(resp, refresh)
+    return resp, 200
 
-        # Assuming the user has a relationship with roles, fetch the user's role(s)
-        user_roles = [role.name for role in user.roles]  # Get list of role names
 
-        # Return the access token and user's roles
-        return jsonify({
-            "access_token": access_token,
-            "roles": user_roles  # Include roles in the response
-        }), 200
+@admin_bp.post("/token/refresh")
+@jwt_required(refresh=True)
+def refresh():
+    revoke_token(get_jwt())                    # blacklist old refresh
+    identity    = get_jwt_identity()
+    access      = create_access_token(identity=identity, fresh=False)
+    new_refresh = create_refresh_token(identity=identity)
 
-    return jsonify({"msg": "Invalid email or password"}), 401
+    resp = jsonify(msg="refreshed")
+    set_access_cookies(resp,  access)
+    set_refresh_cookies(resp, new_refresh)
+    return resp, 200
+
+
+@admin_bp.post("/logout")
+@jwt_required()
+def logout():
+    revoke_token(get_jwt())           # blacklist access jti
+    resp = jsonify(msg="logged out")
+    unset_jwt_cookies(resp)
+    return resp, 200
+
+@admin_bp.get("/me")
+@jwt_required()
+def me():
+    u = User.query.get(int(get_jwt_identity()))
+
+    return jsonify(email=u.email,
+                   roles=[r.name for r in u.roles])
+
+# --------------------------------------------------------------------
+# helper: ensure current user is an Admin
+def _require_admin():
+    user = User.query.get(int(get_jwt_identity()))
+    if "Admin" not in [r.name for r in user.roles]:
+        abort(403, "Admin role required")
+
+@admin_bp.post("/reset-user-password")
+@jwt_required()
+def reset_user_password():
+    _require_admin()               
+
+    data     = request.get_json(force=True)
+    target_id = data.get("user_id")
+    new_pwd   = data.get("new_password")
+
+    if not target_id or not new_pwd:
+        return jsonify(msg="user_id and new_password required"), 400
+
+    # ─── 1. contrôle de robustesse du nouveau mot de passe ──
+    try:
+        _validate_pwd(new_pwd)                        # ← AJOUTE ICI
+    except ValueError as e:
+        return jsonify(msg=str(e)), 400
+    # ─────────────────────────────────────────────────────────
+
+    user = User.query.get_or_404(target_id)
+    user.password = generate_password_hash(new_pwd)
+    db.session.commit()
+
+    return jsonify(msg=f"Password reset for user {user.email}"), 200
+
+@admin_bp.route('/api/clients', methods=['GET'])
+@jwt_required()
+@roles_required('Admin')
+def list_clients():
+    # only users with the “Client” role
+    clients = User.query\
+        .join(User.roles)\
+        .filter(Role.name == 'Client')\
+        .all()
+
+    return jsonify([
+        { "client_name": u.client_name, "id": u.id }
+        for u in clients
+    ]), 200
+
 
 @admin_bp.route('api/orders', methods=['GET'])
 @jwt_required()
@@ -135,7 +242,10 @@ def view_all_orders():
             "is_option": order.is_option,
             "option_type": order.option_type,     
             "strike": order.strike,               
-            "moneyness": order.moneyness          
+            "moneyness": order.moneyness ,
+            "reference": order.reference,
+
+         
         })
     return jsonify(order_list), 200
 
@@ -481,6 +591,7 @@ def process_uploaded_file(df):
                     existing_order.interbank_rate = row["Interbancaire"]  # Update interbank rate
                     existing_order.historical_loss = row["Historical Loss"]  # Update historical loss
                     existing_order.bank_name = row["Bank"]
+                    existing_order.commission_percent = row["Commission %"]
                     updated_count += 1
                 else:
                     # Create a new order
@@ -495,6 +606,7 @@ def process_uploaded_file(df):
                         interbank_rate=row["Interbancaire"],  # Save interbank rate
                         historical_loss=row["Historical Loss"],  # Save historical loss
                         bank_name=row["Bank"],
+                        commission_percent = row["Commission %"],   # NEW
                         status="Executed",  # Set the default status to "Executed"
                         user=user,
                         order_date=datetime.now()
@@ -522,54 +634,116 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'xls', 'xlsx'}
 
 import io
-
 @admin_bp.route('/upload-orders', methods=['POST'])
 @jwt_required()
-@roles_required('Admin')  # Ensure only Admins can access this route
+@roles_required('Admin')
 def upload_orders():
     """
-    API for admins to upload orders in bulk for multiple clients via an Excel file.
+    Bulk-upload orders for multiple clients from an Excel file.
+    Mandatory columns (case-insensitive):
+        Client | Transaction date | Value date | Currency | Type
+        Amount | Execution rate | Bank | Interbancaire | Historical Loss
+        Commission % | Trade Type
+    Optional:
+        Reference
     """
+    # -------- file sanity ---------------------------------------------------
     if 'file' not in request.files or not allowed_file(request.files['file'].filename):
-        return jsonify({'error': 'Invalid file format. Please upload an Excel file.'}), 400
+        return jsonify({'error': 'Invalid file format – please upload .xls or .xlsx'}), 400
 
-    file = request.files['file']
+    file_stream = io.BytesIO(request.files['file'].read())
+    df = pd.read_excel(file_stream)
 
-    try:
-        # Read the uploaded file using BytesIO for compatibility with pandas
-        file_stream = io.BytesIO(file.read())
+    # -------- 1) Column check (Reference intentionally NOT required) --------
+    required = {
+        "Client", "Transaction date", "Value date", "Currency", "Type",
+        "Amount", "Execution rate", "Bank", "Interbancaire",
+        "Historical Loss", "Commission %", "Trade Type"
+    }
+    missing = required - set(col.strip() for col in df.columns)
+    if missing:
+        return jsonify({'error': f'Missing columns: {sorted(missing)}'}), 400
 
-        # Load the Excel file into a DataFrame
-        df = pd.read_excel(file_stream)
+    # If the Excel doesn’t have a Reference column at all, create an empty one
+    if "Reference" not in df.columns:
+        df["Reference"] = ""
 
-        # Validate required columns
-        required_columns = [
-            "Client", "Transaction date", "Value date", 
-            "Currency", "Type", "Amount", "Execution rate", 
-            "Bank", "Interbancaire", "Historical Loss"
-        ]
-        if not all(col in df.columns for col in required_columns):
-            return jsonify({'error': f'Missing required columns. Ensure {required_columns} are present.'}), 400
+    # -------- 2) Cleaning & coercion ---------------------------------------
+    df["Transaction date"] = pd.to_datetime(df["Transaction date"])
+    df["Value date"]       = pd.to_datetime(df["Value date"])
+    df["Amount"]           = df["Amount"].replace(",", "", regex=True).astype(float)
+    df["Execution rate"]   = df["Execution rate"].replace(",", ".", regex=True).astype(float)
+    df["Interbancaire"]    = df["Interbancaire"].replace(",", ".", regex=True).astype(float)
+    df["Historical Loss"]  = df["Historical Loss"].replace(",", ".", regex=True).astype(float)
+    df["Commission %"]     = df["Commission %"].replace(",", ".", regex=True).astype(float)
+    df["Trade Type"]       = df["Trade Type"].str.lower().str.strip()
+    df["Reference"]        = df["Reference"].fillna("").astype(str).str.strip()
 
-        # Data Cleaning and Transformation
-        df["Transaction date"] = pd.to_datetime(df["Transaction date"])
-        df["Value date"] = pd.to_datetime(df["Value date"])
-        df["Amount"] = df["Amount"].replace(",", "", regex=True).astype(float)
-        df["Execution rate"] = df["Execution rate"].replace(",", ".", regex=True).astype(float)
-        df["Interbancaire"] = df["Interbancaire"].replace(",", ".", regex=True).astype(float)
-        df["Historical Loss"] = df["Historical Loss"].replace(",", ".", regex=True).astype(float)  # Clean and convert historical loss
+    allowed_types = {"spot", "forward", "option"}
+    if not df["Trade Type"].isin(allowed_types).all():
+        bad = df.loc[~df["Trade Type"].isin(allowed_types), "Trade Type"].unique()
+        return jsonify({'error': f'Invalid Trade Type values: {bad}'}), 400
 
-        # Process the uploaded data
-        result = process_uploaded_file(df)
+    # -------- 3) Persist ----------------------------------------------------
+    uploaded, updated = 0, 0
+    for idx, row in df.iterrows():
+        client = User.query.filter_by(client_name=row["Client"]).first()
+        if not client:
+            return jsonify({'error': f'No user found for client {row["Client"]}'}), 400
 
-        return jsonify({
-            'message': 'Orders uploaded successfully',
-            'uploaded_count': result["uploaded"],
-            'updated_count': result["updated"]
-        }), 200
+        # ---- reference validation (only if the *client* needs it) ----------
+        try:
+            require_reference_if_needed(client, {"reference": row["Reference"]})
+        except ValueError as e:
+            # +2 because idx is zero-based and header is row 1
+            return jsonify({'error': f'Row {idx+2}: {e}'}), 400
 
-    except Exception as e:
-        return jsonify({'error': f'Failed to process file: {str(e)}'}), 500
+        # ---- upsert logic --------------------------------------------------
+        order = Order.query.filter_by(
+            transaction_date=row["Transaction date"],
+            value_date=row["Value date"],
+            currency=row["Currency"],
+            transaction_type=row["Type"],
+            amount=row["Amount"],
+            user_id=client.id
+        ).first()
+
+        common_fields = dict(
+            reference          = row["Reference"] or None,   # ← NEW
+            bank_name          = row["Bank"],
+            execution_rate     = row["Execution rate"],
+            interbank_rate     = row["Interbancaire"],
+            historical_loss    = row["Historical Loss"],
+            commission_percent = row["Commission %"],
+            trade_type         = row["Trade Type"],
+            status             = "Executed",
+        )
+
+        if order:                                  # update existing
+            for k, v in common_fields.items():
+                setattr(order, k, v)
+            updated += 1
+        else:                                      # create new
+            order = Order(
+                transaction_date=row["Transaction date"],
+                value_date      = row["Value date"],
+                currency        = row["Currency"],
+                transaction_type=row["Type"],
+                amount          = row["Amount"],
+                original_amount = row["Amount"],
+                user_id         = client.id,
+                order_date      = datetime.now(),
+                **common_fields
+            )
+            db.session.add(order)
+            uploaded += 1
+
+    db.session.commit()
+    return jsonify({
+        "message": "Orders uploaded successfully",
+        "uploaded_count": uploaded,
+        "updated_count": updated
+    }), 200
 
 # ========== ADMIN: PREMIUM RATE ENDPOINTS ==========
 
@@ -652,10 +826,10 @@ def upsert_exchange_data():
     """
     Reads the latest JSON files (midmarket & yield) from /data folder,
     and upserts into the exchange_data table.
+    Also back-fills any dates that appear only in the yield file.
     Returns debug logs in the API response.
     """
-    debug_messages = []  # Store debug logs
-
+    debug_messages = []
     data_dir = os.path.join(current_app.root_path, 'data')
     debug_messages.append(f"Data directory: {data_dir}")
 
@@ -663,140 +837,165 @@ def upsert_exchange_data():
         all_files = os.listdir(data_dir)
         debug_messages.append(f"Files in directory: {all_files}")
     except Exception as e:
-        return jsonify({
-            'message': f'Error accessing data directory: {str(e)}',
-            'debug': debug_messages
-        }), 500
+        return jsonify({'message': f'Error accessing data directory: {e}', 'debug': debug_messages}), 500
 
-    # Regex patterns
-    mid_pattern = re.compile(r"midmarket_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
-    yield_pattern = re.compile(r"daily_yield_rates_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+    mid_pattern   = re.compile(r"midmarket_rates_\d{4}-\d{2}-\d{2}_\d{4}\.json")
+    yield_pattern = re.compile(r"daily_yield_rates_\d{4}-\d{2}-\d{2}_\d{4}\.json")
 
-    mid_files = sorted([f for f in all_files if mid_pattern.search(f)])
-    yield_files = sorted([f for f in all_files if yield_pattern.search(f)])
+    mid_files   = sorted(f for f in all_files if mid_pattern.search(f))
+    yield_files = sorted(f for f in all_files if yield_pattern.search(f))
     debug_messages.append(f"Found mid_files: {mid_files}")
     debug_messages.append(f"Found yield_files: {yield_files}")
 
     if not mid_files or not yield_files:
-        return jsonify({
-            'message': 'Required JSON files are missing',
-            'debug': debug_messages
-        }), 404
+        return jsonify({'message': 'Required JSON files are missing', 'debug': debug_messages}), 404
 
-    latest_mid_file = os.path.join(data_dir, mid_files[-1])
-    latest_yield_file = os.path.join(data_dir, yield_files[-1])
-    debug_messages.append(f"Latest mid file: {latest_mid_file}")
-    debug_messages.append(f"Latest yield file: {latest_yield_file}")
+    latest_mid   = os.path.join(data_dir, mid_files[-1])
+    latest_yield = os.path.join(data_dir, yield_files[-1])
+    debug_messages += [f"Latest mid file: {latest_mid}", f"Latest yield file: {latest_yield}"]
 
     try:
-        with open(latest_mid_file, 'r') as f:
-            mid_data = json.load(f)
-        with open(latest_yield_file, 'r') as f:
-            yield_data = json.load(f)
-        debug_messages.append(f"Loaded {len(mid_data)} mid-data records")
-        debug_messages.append(f"Loaded {len(yield_data)} yield-data records")
+        mid_data   = json.load(open(latest_mid))
+        yield_data = json.load(open(latest_yield))
+        debug_messages += [
+            f"Loaded {len(mid_data)} mid-data records",
+            f"Loaded {len(yield_data)} yield-data records"
+        ]
     except Exception as e:
-        return jsonify({
-            'message': f'Error reading JSON files: {str(e)}',
-            'debug': debug_messages
-        }), 500
+        return jsonify({'message': f'Error reading JSON: {e}', 'debug': debug_messages}), 500
 
-    records_processed = 0
-    for mid_record in mid_data:
-        ts_str = mid_record.get('Timestamp')
-        if not ts_str:
-            debug_messages.append("Skipping record: 'Timestamp' key missing or empty.")
+    # --- 1) Process all mid-market dates (with matching yields if available) ---
+    processed_dates = set()
+
+    for m in mid_data:
+        ts = m.get('Timestamp')
+        if not ts:
+            debug_messages.append("Skipping mid record without Timestamp")
             continue
 
         try:
-            # IMPORTANT CHANGE: Remove "datetime.datetime."
-            mid_date = datetime.fromisoformat(ts_str).date()
-            debug_messages.append(f"Parsed date: {ts_str} => {mid_date}")
+            d = datetime.fromisoformat(ts).date()
+            debug_messages.append(f"Parsed mid date: {ts} => {d}")
         except Exception as e:
-            debug_messages.append(f"Skipping record - parse error [{ts_str}]: {str(e)}")
+            debug_messages.append(f"Skipping mid parse error [{ts}]: {e}")
             continue
 
-        spot_usd = mid_record.get('spotUSD')
-        spot_eur = mid_record.get('spotEUR')
+        processed_dates.add(d)
 
-        # Find matching yield by date
-        match = None
-        for y in yield_data:
-            y_ts_str = y.get('Timestamp')
-            if not y_ts_str:
-                continue
-            try:
-                yd_date = datetime.fromisoformat(y_ts_str).date()
-                if yd_date == mid_date:
-                    match = y
-                    break
-            except Exception as e:
-                # Just skip yields that fail parse
-                continue
+        # look for the matching yield entry
+        match = next(
+            (y for y in yield_data
+             if y.get('Timestamp') 
+                and datetime.fromisoformat(y['Timestamp']).date() == d),
+            None
+        )
 
         if match:
-            tnd_1m = match.get('Mid_TND')
-            usd_1m = match.get('Mid_USD1M')
-            eur_1m = match.get('Mid_EUR1M')
-            usd_3m = match.get('Mid_USD3M')
-            usd_6m = match.get('Mid_USD6M')
-            eur_3m = match.get('Mid_EUR3M')
-            eur_6m = match.get('Mid_EUR6M')
-            debug_messages.append(f"Found matching yield for {mid_date}")
+            debug_messages.append(f"Found matching yield for {d}")
+            tnd_1m  = match.get('Mid_TND')
+            usd_1m  = match.get('Mid_USD1M')
+            eur_1m  = match.get('Mid_EUR1M')
+            usd_3m  = match.get('Mid_USD3M')
+            usd_6m  = match.get('Mid_USD6M')
+            eur_3m  = match.get('Mid_EUR3M')
+            eur_6m  = match.get('Mid_EUR6M')
         else:
+            debug_messages.append(f"No yield match for {d}")
             tnd_1m = usd_1m = eur_1m = usd_3m = usd_6m = eur_3m = eur_6m = None
-            debug_messages.append(f"No yield match found for {mid_date}")
 
-        # Upsert into ExchangeData
-        record = ExchangeData.query.filter_by(date=mid_date).first()
-        if record:
-            # Update existing
-            record.spot_usd = spot_usd
-            record.spot_eur = spot_eur
-            if tnd_1m is not None: record.tnd_1m = tnd_1m
-            if usd_1m is not None: record.usd_1m = usd_1m
-            if eur_1m is not None: record.eur_1m = eur_1m
-            if usd_3m is not None: record.usd_3m = usd_3m
-            if usd_6m is not None: record.usd_6m = usd_6m
-            if eur_3m is not None: record.eur_3m = eur_3m
-            if eur_6m is not None: record.eur_6m = eur_6m
-            debug_messages.append(f"Updated existing record for {mid_date}")
+        rec = ExchangeData.query.filter_by(date=d).first()
+        if rec:
+            # update
+            rec.spot_usd = m.get('spotUSD') or 0.0
+            rec.spot_eur = m.get('spotEUR') or 0.0
+            if tnd_1m is not None:  rec.tnd_1m = tnd_1m
+            if usd_1m is not None:  rec.usd_1m = usd_1m
+            if eur_1m is not None:  rec.eur_1m = eur_1m
+            if usd_3m is not None:  rec.usd_3m = usd_3m
+            if usd_6m is not None:  rec.usd_6m = usd_6m
+            if eur_3m is not None:  rec.eur_3m = eur_3m
+            if eur_6m is not None:  rec.eur_6m = eur_6m
+            debug_messages.append(f"Updated record for {d}")
         else:
-            # Create new
-            new_record = ExchangeData(
-                date=mid_date,
-                spot_usd=spot_usd,
-                spot_eur=spot_eur,
-                tnd_1m=tnd_1m or 0.0,
-                usd_1m=usd_1m or 0.0,
-                eur_1m=eur_1m or 0.0,
-                usd_3m=usd_3m or 0.0,
-                usd_6m=usd_6m or 0.0,
-                eur_3m=eur_3m or 0.0,
-                eur_6m=eur_6m or 0.0,
+            # create new
+            new = ExchangeData(
+                date=d,
+                spot_usd=m.get('spotUSD') or 0.0,
+                spot_eur=m.get('spotEUR')or 0.0,
+                tnd_1m=tnd_1m  or 0.0,
+                usd_1m=usd_1m  or 0.0,
+                eur_1m=eur_1m  or 0.0,
+                usd_3m=usd_3m  or 0.0,
+                usd_6m=usd_6m  or 0.0,
+                eur_3m=eur_3m  or 0.0,
+                eur_6m=eur_6m  or 0.0,
+                # if you really want TND 3m/6m equal to overnight:
                 tnd_3m=tnd_1m or 0.0,
                 tnd_6m=tnd_1m or 0.0,
             )
-            db.session.add(new_record)
-            debug_messages.append(f"Created new record for {mid_date}")
+            db.session.add(new)
+            debug_messages.append(f"Created record for {d}")
 
-        records_processed += 1
+    # --- 2) Now back-fill any dates that appear only in the yield file ---
+    for y in yield_data:
+        y_ts = y.get('Timestamp')
+        if not y_ts:
+            continue
+        try:
+            d = datetime.fromisoformat(y_ts).date()
+        except:
+            continue
 
+        # skip any date we already did in the mid-loop
+        if d in processed_dates:
+            continue
+
+        # these are yield-only dates
+        tnd_1m  = y.get('Mid_TND')   or 0.0
+        usd_1m  = y.get('Mid_USD1M') or 0.0
+        eur_1m  = y.get('Mid_EUR1M') or 0.0
+        usd_3m  = y.get('Mid_USD3M') or 0.0
+        usd_6m  = y.get('Mid_USD6M') or 0.0
+        eur_3m  = y.get('Mid_EUR3M') or 0.0
+        eur_6m  = y.get('Mid_EUR6M') or 0.0
+
+        rec = ExchangeData.query.filter_by(date=d).first()
+        if rec:
+            rec.tnd_1m = tnd_1m
+            rec.usd_1m = usd_1m
+            rec.eur_1m = eur_1m
+            rec.usd_3m = usd_3m
+            rec.usd_6m = usd_6m
+            rec.eur_3m = eur_3m
+            rec.eur_6m = eur_6m
+            debug_messages.append(f"Updated yields for existing date {d}")
+        else:
+            new = ExchangeData(
+                date=d,
+                spot_usd=0.0,  # no spot data
+                spot_eur=0.0,
+                tnd_1m=tnd_1m,
+                usd_1m=usd_1m,
+                eur_1m=eur_1m,
+                usd_3m=usd_3m,
+                usd_6m=usd_6m,
+                eur_3m=eur_3m,
+                eur_6m=eur_6m,
+                tnd_3m=tnd_1m,
+                tnd_6m=tnd_1m,
+            )
+            db.session.add(new)
+            debug_messages.append(f"Inserted yield-only record for {d}")
+
+    # finally commit
     try:
         db.session.commit()
-        debug_messages.append(f"{records_processed} mid-data records processed (some might be skipped if parse failed).")
-        return jsonify({
-            'message': 'Exchange data upserted successfully',
-            'debug': debug_messages
-        }), 200
+        debug_messages.append("All changes committed")
+        return jsonify({'message':'Exchange data upserted','debug':debug_messages}), 200
     except Exception as e:
         db.session.rollback()
-        debug_messages.append(f"Error committing changes: {str(e)}")
-        return jsonify({
-            'message': f'Error updating database: {str(e)}',
-            'debug': debug_messages
-        }), 500
-
+        debug_messages.append(f"Commit failed: {e}")
+        return jsonify({'message':f'Error updating DB: {e}','debug':debug_messages}),500
 
 @admin_bp.route('/api/debug-exchange', methods=['GET'])
 def debug_exchange():
@@ -827,7 +1026,7 @@ def debug_exchange():
 @admin_bp.route('/api/internal-emails', methods=['GET'])
 @jwt_required()
 def get_internal_emails():
-    user_id = get_jwt_identity()
+    user_id =  int(get_jwt_identity())
     user = User.query.get(user_id)
     
     # Optional query parameter "type" to filter emails by type
@@ -872,6 +1071,7 @@ def update_order(order_id):
     order.execution_rate = data.get("execution_rate", order.execution_rate)
     order.bank_name = data.get("bank_name", order.bank_name)
     order.historical_loss=data.get("historical_loss", order.historical_loss)
+    order.reference = data.get("reference", order.reference)     
 
     # Update any additional fields here...
     db.session.commit()
@@ -1012,39 +1212,237 @@ from flask import send_file
 @admin_bp.route('/generate-my-excel', methods=['GET'])
 @jwt_required()
 def generate_my_excel():
-    current_user_id = get_jwt_identity()  # the user’s ID from the token
+    current_user_id = int(get_jwt_identity())
     orders = Order.query.filter_by(user_id=current_user_id).all()
 
-       # 2) Prepare list of dicts for DataFrame
     data_rows = []
     for o in orders:
-        data_rows.append({
-            # EXACT HEADERS from your screenshot:
-            "Date Transaction": o.transaction_date.strftime("%d/%m/%Y") if o.transaction_date else "",
-            "Date valeur": o.value_date.strftime("%d/%m/%Y") if o.value_date else "",
-            "Devise": o.currency,
-            "Type": o.transaction_type,           # e.g., "buy"/"sell" or "import"/"export"
-            "Type d’opération": o.trade_type,     # "spot"/"forward"/"option"
-            "Montant (fc)": o.original_amount,
-            "Taux d’execution": o.execution_rate or "",
-            "Banque": o.bank_name or "",
+        row = {
+            "Date Transaction" : o.transaction_date.strftime("%d/%m/%Y") if o.transaction_date else "",
+            "Date valeur"      : o.value_date.strftime("%d/%m/%Y")       if o.value_date       else "",
+            "Devise"           : o.currency,
+            "Type"             : o.transaction_type,     # buy / sell …
+            "Type d’opération" : o.trade_type,           # spot / forward / option
+            "Montant (fc)"     : o.original_amount,
+            "Taux d’execution" : o.execution_rate or "",
+            "Banque"           : o.bank_name or "",
             "Taux de référence": o.benchmark_rate or "",
-     
-        })
+        }
 
-    # 3) Convert to DataFrame
+        # add “Référence” only when it carries a real value
+        if o.reference not in (None, "", 0, "0"):
+            row["Référence"] = o.reference
+
+        data_rows.append(row)
+
     df = pd.DataFrame(data_rows)
 
-    # 4) Write to Excel in memory
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='OrdersData')
     output.seek(0)
 
-    # 5) Send the file back as an attachment
     return send_file(
         output,
         as_attachment=True,
         download_name="OrdersReport.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+def pick(rec: dict, ric: str, side: str):
+    """
+    Retourne la valeur v telle que la clé k contient à la fois
+    le RIC (ex: 'EURTNDX=BCTX') et le side ('BID' ou 'ASK').
+    Si rien trouvé -> None
+    """
+    for k, v in rec.items():
+        if ric in k and side in k:
+            return v
+    return None
+
+
+@admin_bp.route('/api/upsert-bctx', methods=['POST'])
+def upsert_bctx_data():
+    """
+    Reads the LATEST bctx_data_YYYY-MM-DD_HHMM.json file from /app/data,
+    then upserts into bctx_fixings. 
+    """
+
+    debug_messages = []
+    data_dir = os.path.join(current_app.root_path, 'data')
+    
+    # 1) Find the newest bctx_data_... file
+    pattern = re.compile(r"bctx_data_(\d{4}-\d{2}-\d{2}_\d{4})\.json")
+    
+    try:
+        all_files = os.listdir(data_dir)
+        bctx_files = sorted([f for f in all_files if pattern.search(f)])
+        if not bctx_files:
+            return jsonify({"message": "No bctx_data_*.json files found"}), 404
+        
+        # The last one is the newest
+        latest_bctx_file = bctx_files[-1]
+        bctx_file_path = os.path.join(data_dir, latest_bctx_file)
+
+    except Exception as e:
+        return jsonify({"message": f"Error accessing data_dir or listing files: {str(e)}"}), 500
+
+    # 2) Read that JSON file
+    try:
+        with open(bctx_file_path, 'r') as f:
+            bctx_data = json.load(f)
+    except Exception as e:
+        return jsonify({"message": f"Error reading {latest_bctx_file}: {str(e)}"}), 500
+
+    if not isinstance(bctx_data, list):
+        return jsonify({"message": "Invalid JSON structure: expected a list"}), 400
+
+    records_processed = 0
+
+    # 3) Upsert logic
+    for rec in bctx_data:
+        # Try standard key
+        ts_str = rec.get("Timestamp")
+
+        # If not found, try fallback pattern like "('Timestamp', '')"
+        if not ts_str:
+            for key in rec:
+                if "Timestamp" in key:
+                    ts_str = rec[key]
+                    break
+
+        if not ts_str:
+            debug_messages.append("Skipping record with missing Timestamp.")
+            continue
+
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(ts_str.replace("Z",""))
+        except ValueError as e:
+            debug_messages.append(f"Skipping invalid Timestamp '{ts_str}': {e}")
+            continue
+
+        if ts.hour < 12:
+            session = "morning"
+        else:
+            session = "afternoon"
+
+        the_date = ts.date()
+
+        # Extract the numeric data
+       
+        tnd_bid = pick(rec, "TND=BCTX", "BID")
+        tnd_ask = pick(rec, "TND=BCTX", "ASK")
+
+        eur_bid = pick(rec, "EURTNDX=BCTX", "BID")
+        eur_ask = pick(rec, "EURTNDX=BCTX", "ASK")
+
+        gbp_bid = pick(rec, "GBPTNDX=BCTX", "BID")
+        gbp_ask = pick(rec, "GBPTNDX=BCTX", "ASK")
+
+        jpy_bid = pick(rec, "JPYTNDX=BCTX", "BID")
+        jpy_ask = pick(rec, "JPYTNDX=BCTX", "ASK")
+
+        # Check if we already have a row for that date+session
+        existing = BctxFixing.query.filter_by(date=the_date, session=session).first()
+        if existing:
+            existing.original_timestamp = ts
+            existing.tnd_bid = tnd_bid
+            existing.tnd_ask = tnd_ask
+            existing.eur_bid = eur_bid
+            existing.eur_ask = eur_ask
+            existing.gbp_bid = gbp_bid
+            existing.gbp_ask = gbp_ask
+            existing.jpy_bid = jpy_bid
+            existing.jpy_ask = jpy_ask
+            debug_messages.append(f"Updated {the_date} {session}.")
+        else:
+            new_row = BctxFixing(
+                date=the_date,
+                session=session,
+                original_timestamp=ts,
+                tnd_bid=tnd_bid,
+                tnd_ask=tnd_ask,
+                eur_bid=eur_bid,
+                eur_ask=eur_ask,
+                gbp_bid=gbp_bid,
+                gbp_ask=gbp_ask,
+                jpy_bid=jpy_bid,
+                jpy_ask=jpy_ask
+            )
+            db.session.add(new_row)
+            debug_messages.append(f"Inserted new record for {the_date} {session}.")
+
+        records_processed += 1
+
+    # 4) Commit
+    try:
+        db.session.commit()
+        debug_messages.append(f"Processed {records_processed} records from {latest_bctx_file}.")
+        return jsonify({
+            "message": "BCTX fixings upsert complete",
+            "records_processed": records_processed,
+            "debug": debug_messages
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"DB commit error: {str(e)}"}), 500
+
+@admin_bp.route('/api/tca/inputs', methods=['POST'])
+@jwt_required()
+def upload_tca_for_client():
+    # 1) get client_name from query or form
+    client_name = request.args.get('client_name') or request.form.get('client_name')
+    if not client_name:
+        return jsonify({"error": "Must include client_name (e.g. ?client_name=AcmeCorp)"}), 400
+
+    # 2) look up that user
+    user = User.query.filter_by(client_name=client_name).first()
+    if not user:
+        return jsonify({"error": f"No client found with name '{client_name}'"}), 404
+    client_id = user.id
+
+    # 3) grab the Excel file
+    if 'file' not in request.files or request.files['file'].filename == '':
+        return jsonify({"error": "Please attach an .xls or .xlsx file under key ‘file’"}), 400
+    f = request.files['file']
+
+    # 4) read with pandas
+    try:
+        df = pd.read_excel(f)
+    except Exception as e:
+        return jsonify({"error": f"Could not read Excel: {e}"}), 400
+
+    # 5) validate columns
+    required = {
+      "transaction_date", "value_date",
+      "currency", "amount",
+      "execution_rate", "transaction_type"
+    }
+    missing = required - set(df.columns.str.lower())
+    if missing:
+        return jsonify({"error": f"Missing columns: {sorted(missing)}"}), 400
+
+    # 6) clear old inputs for that client
+    TcaSpotInput.query.filter_by(client_id=client_id).delete()
+
+    # 7) bulk‐create new inputs
+    objs = []
+    for row in df.itertuples(index=False):
+        objs.append(TcaSpotInput(
+            client_id        = client_id,
+            transaction_date = pd.to_datetime(row.transaction_date).date(),
+            value_date       = pd.to_datetime(row.value_date).date(),
+            currency         = row.currency.upper(),
+            amount           = float(row.amount),
+            execution_rate   = float(row.execution_rate),
+            transaction_type = row.transaction_type.lower(),
+        ))
+    db.session.bulk_save_objects(objs)
+    db.session.commit()
+
+    return jsonify({
+        "message":   f"{len(objs)} records uploaded for '{client_name}'",
+        "client_id": client_id
+    }), 200
