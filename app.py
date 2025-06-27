@@ -16,7 +16,7 @@ from user.routes import user_bp, init_socketio, delete_expired_positions, \
                          update_interbank_rates_db_logic
 from invoice import invoice_bp
 from accounts import accounts_bp
-from tca import tca_bp
+from tca.routes import tca_bp
 
 load_dotenv()
 

@@ -1,6 +1,6 @@
 # tca/routes.py
+from . import tca_bp
 from datetime import timedelta
-from flask import Blueprint
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from flask import request, jsonify
 from sqlalchemy import func
@@ -8,7 +8,6 @@ from models import db, User,  Order, AuditLog, ExchangeData, OpenPosition, Premi
 from user.routes import calculate_forward_rate, get_interbank_rate_from_db, get_yield_period
 from collections import defaultdict     
 
-tca_bp = Blueprint('tca_bp', __name__) 
 
 # helper ───────────────────────────────────────────────────────────
 def _effective_client_id(current_user_id: int, query_id: str | None) -> int:
