@@ -109,7 +109,7 @@ class Order(db.Model):
     strike = db.Column(db.Float, nullable=True)            # user input or None
     forward_rate = db.Column(db.Float, nullable=True)      # store the computed forward
     moneyness = db.Column(db.String(20), nullable=True) 
-    premium = db.Column(db.Float, nullable=True)  # If not NULL => it's an Option
+    premium = db.Column(db.Float, nullable=True)  
     is_option = db.Column(db.Boolean, default=False)
     trade_type = db.Column(db.String(10), nullable=False, default="spot")  #  "spot", "forward", or "option"
     benchmark_rate = db.Column(db.Float, nullable=True, default=None)  

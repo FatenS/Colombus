@@ -13,6 +13,8 @@ from collections import defaultdict
 from flask import Blueprint, abort, render_template, request, redirect, url_for, send_file, make_response, jsonify, flash, session
 from datetime import datetime, timedelta
 from sqlalchemy import func
+
+from user.templates import _make_excel
 from .services.export_service import export_pdf, download_excel
 from models import db, Order, ExchangeData
 from flask_login import login_user, logout_user, current_user
@@ -22,7 +24,7 @@ from flask_security import roles_accepted
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, get_jwt_identity, jwt_required, get_jwt, unset_jwt_cookies
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import current_app
-from user.routes import require_reference_if_needed, user_bp, fetch_rate_for_date_and_currency
+from user.routes import get_interbank_rate_from_db, require_reference_if_needed, user_bp, fetch_rate_for_date_and_currency
 from extentions import limiter, revoke_token          
 
 
@@ -214,7 +216,7 @@ def list_clients():
     ]), 200
 
 
-@admin_bp.route('api/orders', methods=['GET'])
+@admin_bp.route('/api/orders', methods=['GET'])
 @jwt_required()
 def view_all_orders():
     orders = Order.query.options(joinedload(Order.user)).filter(Order.deleted == False).all()
@@ -561,189 +563,8 @@ def get_logs():
 
     return jsonify(log_list), 200
 
-def process_uploaded_file(df):
-    try:
-        uploaded_count = 0
-        updated_count = 0
-
-        for _, row in df.iterrows():
-            try:
-                # Match client name to a user
-                client_name = row["Client"]
-                user = User.query.filter_by(client_name=client_name).first()
-
-                if not user:
-                    raise Exception(f"No user found for client: {client_name}")
-
-                # Check if an order with the same details already exists
-                existing_order = Order.query.filter_by(
-                    transaction_date=row["Transaction date"],
-                    value_date=row["Value date"],
-                    currency=row["Currency"],
-                    transaction_type=row["Type"],
-                    amount=row["Amount"],
-                    user_id=user.id
-                ).first()
-
-                if existing_order:
-                    # Update the existing order
-                    existing_order.execution_rate = row["Execution rate"]
-                    existing_order.interbank_rate = row["Interbancaire"]  # Update interbank rate
-                    existing_order.historical_loss = row["Historical Loss"]  # Update historical loss
-                    existing_order.bank_name = row["Bank"]
-                    existing_order.commission_percent = row["Commission %"]
-                    updated_count += 1
-                else:
-                    # Create a new order
-                    new_order = Order(
-                        transaction_date=row["Transaction date"],
-                        value_date=row["Value date"],
-                        currency=row["Currency"],
-                        transaction_type=row["Type"],
-                        amount=row["Amount"],
-                        original_amount=row["Amount"],  # Save the initial amount
-                        execution_rate=row["Execution rate"],
-                        interbank_rate=row["Interbancaire"],  # Save interbank rate
-                        historical_loss=row["Historical Loss"],  # Save historical loss
-                        bank_name=row["Bank"],
-                        commission_percent = row["Commission %"],   # NEW
-                        status="Executed",  # Set the default status to "Executed"
-                        user=user,
-                        order_date=datetime.now()
-                    )
-                    db.session.add(new_order)
-                    uploaded_count += 1
-
-            except Exception as e:
-                raise Exception(f"Error processing row: {e}")
-
-        db.session.commit()
-
-        return {
-            "uploaded": uploaded_count,
-            "updated": updated_count
-        }
-
-    except Exception as e:
-        db.session.rollback()
-        raise Exception(f"Bulk upload failed: {str(e)}")
-
-
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'xls', 'xlsx'}
-
-import io
-@admin_bp.route('/upload-orders', methods=['POST'])
-@jwt_required()
-@roles_required('Admin')
-def upload_orders():
-    """
-    Bulk-upload orders for multiple clients from an Excel file.
-    Mandatory columns (case-insensitive):
-        Client | Transaction date | Value date | Currency | Type
-        Amount | Execution rate | Bank | Interbancaire | Historical Loss
-        Commission % | Trade Type
-    Optional:
-        Reference
-    """
-    # -------- file sanity ---------------------------------------------------
-    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
-        return jsonify({'error': 'Invalid file format – please upload .xls or .xlsx'}), 400
-
-    file_stream = io.BytesIO(request.files['file'].read())
-    df = pd.read_excel(file_stream)
-
-    # -------- 1) Column check (Reference intentionally NOT required) --------
-    required = {
-        "Client", "Transaction date", "Value date", "Currency", "Type",
-        "Amount", "Execution rate", "Bank", "Interbancaire",
-        "Historical Loss", "Commission %", "Trade Type"
-    }
-    missing = required - set(col.strip() for col in df.columns)
-    if missing:
-        return jsonify({'error': f'Missing columns: {sorted(missing)}'}), 400
-
-    # If the Excel doesn’t have a Reference column at all, create an empty one
-    if "Reference" not in df.columns:
-        df["Reference"] = ""
-
-    # -------- 2) Cleaning & coercion ---------------------------------------
-    df["Transaction date"] = pd.to_datetime(df["Transaction date"])
-    df["Value date"]       = pd.to_datetime(df["Value date"])
-    df["Amount"]           = df["Amount"].replace(",", "", regex=True).astype(float)
-    df["Execution rate"]   = df["Execution rate"].replace(",", ".", regex=True).astype(float)
-    df["Interbancaire"]    = df["Interbancaire"].replace(",", ".", regex=True).astype(float)
-    df["Historical Loss"]  = df["Historical Loss"].replace(",", ".", regex=True).astype(float)
-    df["Commission %"]     = df["Commission %"].replace(",", ".", regex=True).astype(float)
-    df["Trade Type"]       = df["Trade Type"].str.lower().str.strip()
-    df["Reference"]        = df["Reference"].fillna("").astype(str).str.strip()
-
-    allowed_types = {"spot", "forward", "option"}
-    if not df["Trade Type"].isin(allowed_types).all():
-        bad = df.loc[~df["Trade Type"].isin(allowed_types), "Trade Type"].unique()
-        return jsonify({'error': f'Invalid Trade Type values: {bad}'}), 400
-
-    # -------- 3) Persist ----------------------------------------------------
-    uploaded, updated = 0, 0
-    for idx, row in df.iterrows():
-        client = User.query.filter_by(client_name=row["Client"]).first()
-        if not client:
-            return jsonify({'error': f'No user found for client {row["Client"]}'}), 400
-
-        # ---- reference validation (only if the *client* needs it) ----------
-        try:
-            require_reference_if_needed(client, {"reference": row["Reference"]})
-        except ValueError as e:
-            # +2 because idx is zero-based and header is row 1
-            return jsonify({'error': f'Row {idx+2}: {e}'}), 400
-
-        # ---- upsert logic --------------------------------------------------
-        order = Order.query.filter_by(
-            transaction_date=row["Transaction date"],
-            value_date=row["Value date"],
-            currency=row["Currency"],
-            transaction_type=row["Type"],
-            amount=row["Amount"],
-            user_id=client.id
-        ).first()
-
-        common_fields = dict(
-            reference          = row["Reference"] or None,   # ← NEW
-            bank_name          = row["Bank"],
-            execution_rate     = row["Execution rate"],
-            interbank_rate     = row["Interbancaire"],
-            historical_loss    = row["Historical Loss"],
-            commission_percent = row["Commission %"],
-            trade_type         = row["Trade Type"],
-            status             = "Executed",
-        )
-
-        if order:                                  # update existing
-            for k, v in common_fields.items():
-                setattr(order, k, v)
-            updated += 1
-        else:                                      # create new
-            order = Order(
-                transaction_date=row["Transaction date"],
-                value_date      = row["Value date"],
-                currency        = row["Currency"],
-                transaction_type=row["Type"],
-                amount          = row["Amount"],
-                original_amount = row["Amount"],
-                user_id         = client.id,
-                order_date      = datetime.now(),
-                **common_fields
-            )
-            db.session.add(order)
-            uploaded += 1
-
-    db.session.commit()
-    return jsonify({
-        "message": "Orders uploaded successfully",
-        "uploaded_count": uploaded,
-        "updated_count": updated
-    }), 200
 
 # ========== ADMIN: PREMIUM RATE ENDPOINTS ==========
 
@@ -1446,3 +1267,143 @@ def upload_tca_for_client():
         "message":   f"{len(objs)} records uploaded for '{client_name}'",
         "client_id": client_id
     }), 200
+
+
+
+# -------------  download template for ADMINS (NEW) --------------------
+@admin_bp.get("/download-orders-template")
+@jwt_required()
+@roles_required("Admin")
+def download_orders_template_admin():
+    cols = [
+        "Transaction date", "Value date", "Currency", "Type",
+        "Amount", "Execution rate", "Bank", "Interbancaire",
+        "Historical Loss", "Commission %", "Trade Type",  # ← req.
+        "Reference"                                       # ← optional
+    ]
+    sample = {
+        "Transaction date": "2025/07/01",
+        "Value date":       "2025/07/04",
+        "Currency":         "USD",
+        "Type":             "buy",
+        "Amount":           1000000,
+        "Execution rate":   3.1450,
+        "Bank":             "BNP",
+        "Interbancaire":    3.1400,
+        "Historical Loss":  0.009,
+        "Commission %":     0.15,
+        "Trade Type":       "spot",
+        "Reference":        "azerty",          
+    }
+    return _make_excel(cols, sample, filename="OrdersTemplate_Admin.xlsx")
+@admin_bp.post("/upload-orders")
+@jwt_required()
+@roles_required("Admin")
+def upload_orders():
+    """
+    Bulk-upload Spot / Forward / Option orders for **one** client.
+    Mandatory Excel columns
+        Transaction date | Value date | Currency | Type | Amount
+        Execution rate | Bank | Historical Loss | Commission % | Trade Type
+    Optional:
+        Reference | Interbancaire  (leave blank to auto-fill)
+    """
+    # 0) sanity -------------------------------------------------------
+    if "file" not in request.files:
+        return {"error": "No file provided"}, 400
+    if "client_id" not in request.form:
+        return {"error": "client_id is required"}, 400
+    try:
+        client_id = int(request.form["client_id"])
+    except ValueError:
+        return {"error": "client_id must be an integer"}, 400
+
+    client = User.query.get(client_id)
+    if not client:
+        return {"error": f"No user found for id={client_id}"}, 404
+
+    file = request.files["file"]
+    if not allowed_file(file.filename):
+        return {"error": "Invalid file format – please upload .xls or .xlsx"}, 400
+
+    # 1) read --------------------------------------------------------
+    df = pd.read_excel(BytesIO(file.read()))
+
+    required = {
+        "Transaction date", "Value date", "Currency", "Type",
+        "Amount", "Execution rate", "Bank",
+        "Historical Loss", "Commission %", "Trade Type"
+    }
+    missing = required - {c.strip() for c in df.columns}
+    if missing:
+        return {"error": f"Missing columns: {sorted(missing)}"}, 400
+
+    # Optional columns
+    if "Reference"      not in df.columns: df["Reference"]      = ""
+    if "Interbancaire"  not in df.columns: df["Interbancaire"]  = np.nan
+
+    # 2) clean / coerce ---------------------------------------------
+    df["Transaction date"] = pd.to_datetime(df["Transaction date"])
+    df["Value date"]       = pd.to_datetime(df["Value date"])
+    df["Amount"]           = df["Amount"].replace(",", "", regex=True).astype(float)
+    df["Execution rate"]   = df["Execution rate"].replace(",", ".", regex=True).astype(float)
+    df["Historical Loss"]  = df["Historical Loss"].replace(",", ".", regex=True).astype(float)
+    df["Commission %"]     = df["Commission %"].replace(",", ".", regex=True).astype(float)
+    df["Trade Type"]       = df["Trade Type"].str.lower().str.strip()
+    df["Type"]             = df["Type"].str.lower().str.strip()
+
+    uploaded, updated = 0, 0
+    for idx, row in df.iterrows():
+
+        # When admin leaves Interbancaire blank ➜ fetch automatically
+        ib_val = row["Interbancaire"]
+        if ib_val in (None, "", 0, 0.0, np.nan):
+            ib_val = get_interbank_rate_from_db(row["Transaction date"].date(),
+                                                row["Currency"].upper())
+            if ib_val is None:
+                return {"error": f"Row {idx+2}: no interbank rate for "
+                                  f"{row['Currency']} on {row['Transaction date'].date()}"}, 400
+
+        # reference check only if the **client** requires it
+        try:
+            require_reference_if_needed(client, {"reference": row["Reference"]})
+        except ValueError as exc:
+            return {"error": f"Row {idx+2}: {exc}"}, 400
+
+        lookup = dict(
+            transaction_date = row["Transaction date"],
+            value_date       = row["Value date"],
+            currency         = row["Currency"].upper(),
+            transaction_type = row["Type"],
+            amount           = row["Amount"],
+            user_id          = client.id,
+        )
+        common = dict(
+            reference          = row["Reference"] or None,
+            bank_name          = row["Bank"],
+            execution_rate     = row["Execution rate"],
+            interbank_rate     = ib_val,
+            historical_loss    = row["Historical Loss"],
+            commission_percent = row["Commission %"],
+            trade_type         = row["Trade Type"],
+            status             = "Executed",
+        )
+
+        order = Order.query.filter_by(**lookup).first()
+        if order:
+            for k, v in common.items():
+                setattr(order, k, v)
+            updated += 1
+        else:
+            db.session.add(Order(**lookup,
+                                 original_amount=row["Amount"],
+                                 order_date=datetime.utcnow(),
+                                 **common))
+            uploaded += 1
+
+    db.session.commit()
+    return {
+        "message": "Orders processed",
+        "uploaded_count": uploaded,
+        "updated_count": updated
+    }, 200

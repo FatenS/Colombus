@@ -518,74 +518,6 @@ def delete_order_user(order_id):
 
 #=======batch order upload 
 
-@user_bp.route('/upload-orders', methods=['POST'])
-@jwt_required() 
-def upload_orders():
-    """
-    API for clients to upload orders in bulk via an Excel file.
-    """
-    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
-        return jsonify({'error': 'Invalid file format'}), 400
-    
-    file = request.files['file']
-    
-    try:
-        user_id = get_jwt_identity()  
-        user = User.query.get(user_id)  
-
-        result = process_uploaded_file(file.stream, user)  
-        return jsonify({'message': 'Orders uploaded successfully', 'result': result}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@user_bp.route('/download-template')
-def download_template():
-    return send_from_directory('static', 'template.xlsx', as_attachment=True)
-
-def process_uploaded_file(file_stream, user):
-    file_stream.seek(0)
-    bytes_io = BytesIO(file_stream.read())
-    uploaded_data = pd.read_excel(bytes_io)
-
-    try:
-        for index, row in uploaded_data.iterrows():
-            try:
-                transaction_date = convert_to_date(row['Transaction Date'])
-                value_date = convert_to_date(row['Value Date'])
-                currency = row['Currency']
-                amount = row['Amount']
-                transaction_type = row['Transaction Type']
-                interbank_rate = row['Interbancaire']
-                new_order = Order(
-                    value_date=value_date,
-                    transaction_date=transaction_date, 
-                    currency=currency,
-                    amount=amount,  
-                    original_amount=amount,  
-                    transaction_type=transaction_type,
-                    interbank_rate=interbank_rate,
-                    status='Market',
-                    user=user,
-                    order_date=datetime.now(),
-                )
-                db.session.add(new_order)
-            except Exception as e:
-                raise Exception(f"Error processing row {index}: {e}")
-
-        db.session.commit()
-        log_action(
-            action_type='bulk_upload',
-            table_name='order',
-            record_id=-1,   
-            details={"uploaded_orders": len(uploaded_data)}
-        )
-
-        return f"{len(uploaded_data)} orders successfully uploaded."
-
-    except Exception as e:
-        db.session.rollback()  
-        raise Exception(f"Bulk upload failed: {str(e)}")
-    
 #============================live rates and job registration=========
 @user_bp.route('/live-rates', methods=['GET'])
 def get_live_rates():
@@ -1374,3 +1306,85 @@ def dl_tca_spot_tpl():
         "transaction_type": "import",      # import / export
     }
     return _make_excel(cols, sample)
+@user_bp.route('/upload-orders', methods=['POST'])
+@jwt_required()
+def upload_orders():
+    """
+    Bulk-upload Spot / Forward / Option orders for the **logged-in client**.
+    Excel columns (case-insensitive):
+        Transaction Date | Value Date | Currency | Transaction Type
+        Amount | Bank Account | Trade Type | Option Type | Strike | Reference
+    Columns that NO LONGER appear in the sheet (auto-filled server-side):
+        Execution rate, Interbancaire, Historical Loss, Commission %
+    """
+    # 0) sanity check -------------------------------------------------
+    if 'file' not in request.files or not allowed_file(request.files['file'].filename):
+        return jsonify({'error': 'Invalid file format (.xls / .xlsx expected)'}), 400
+
+    file = request.files['file']
+    user_id = get_jwt_identity()
+    user    = User.query.get(user_id)
+
+    try:
+        # 1) read Excel ------------------------------------------------
+        df = pd.read_excel(BytesIO(file.read()))
+
+        required = {
+            "Transaction Date", "Value Date", "Currency",
+            "Transaction Type", "Amount", "Bank Account", "Trade Type"
+        }
+        missing = required - {c.strip() for c in df.columns}
+        if missing:
+            return jsonify({'error': f'Missing columns: {sorted(missing)}'}), 400
+
+        # optional columns
+        if "Reference" not in df.columns:   df["Reference"]   = ""
+        if "Option Type" not in df.columns: df["Option Type"] = ""
+        if "Strike"      not in df.columns: df["Strike"]      = np.nan
+
+        # 2) clean / coerce ------------------------------------------
+        df["Transaction Date"] = pd.to_datetime(df["Transaction Date"])
+        df["Value Date"]       = pd.to_datetime(df["Value Date"])
+        df["Amount"]           = df["Amount"].replace(",", "", regex=True).astype(float)
+        df["Trade Type"]       = df["Trade Type"].str.lower().str.strip()
+        df["Transaction Type"] = df["Transaction Type"].str.lower().str.strip()
+
+        # 3) iterate rows --------------------------------------------
+        uploaded = 0
+        for idx, row in df.iterrows():
+            tx_date = row["Transaction Date"].date()
+            val_date= row["Value Date"].date()
+            currency= row["Currency"].upper()
+
+            ib_rate = get_interbank_rate_from_db(tx_date, currency)
+            if ib_rate is None:
+                raise Exception(f"No interbank rate for {currency} on {tx_date}")
+
+            new_order = Order(
+                user                = user,
+                transaction_type    = row["Transaction Type"],
+                trade_type          = row["Trade Type"],
+                amount              = row["Amount"],
+                original_amount     = row["Amount"],
+                currency            = currency,
+                value_date          = val_date,
+                transaction_date    = tx_date,
+                order_date          = datetime.utcnow(),
+                bank_account        = row["Bank Account"],
+                reference           = row["Reference"] or None,
+                option_type         = (row["Option Type"] or None).upper() if pd.notna(row["Option Type"]) else None,
+                strike              = float(row["Strike"]) if pd.notna(row["Strike"]) else None,
+                status              = "Pending" if row["Trade Type"] == "spot" else "Market",
+                interbank_rate      = ib_rate
+            )
+            db.session.add(new_order)
+            uploaded += 1
+
+        db.session.commit()
+        log_action('bulk_upload', 'order', -1, user_id,
+                   {"uploaded_orders": uploaded})
+        return jsonify({'message': f'{uploaded} orders uploaded'}), 200
+
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 500

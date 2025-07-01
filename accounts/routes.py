@@ -32,7 +32,7 @@ def get_profile():
         "client_name":   u.client_name,
         "rating":        u.rating,
         "phone_number":  u.phone_number,
-        "avatar_url":    u.avatar_url,
+        "avatar_url":    u.avatar_url(),
         "address":       u.address,
     }), 200
 
